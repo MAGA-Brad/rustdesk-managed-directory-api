@@ -7,7 +7,7 @@ use sodiumoxide::crypto::sign;
 use std::{
     io::prelude::*,
     io::Read,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::{Instant, SystemTime},
 };
 
@@ -31,6 +31,41 @@ pub async fn listen_tcp(
         hbb_common::tcp::new_listener(SocketAddr::new(bind_addr, port), true).await
     } else {
         hbb_common::tcp::listen_any(port).await
+    }
+}
+
+pub fn console_addr(bind_addr: Option<IpAddr>, port: u16) -> Option<SocketAddr> {
+    let bind_addr = bind_addr?;
+    if bind_addr.is_unspecified() || bind_addr == IpAddr::V4(Ipv4Addr::LOCALHOST) {
+        return None;
+    }
+    Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+}
+
+// The runtime console (check_cmd) is reached via 127.0.0.1, so when the bind
+// address does not already accept connections to 127.0.0.1 (it is neither the
+// any-address nor 127.0.0.1 itself), the console gets a dedicated listener
+// there; it is never bound to the external bind address.
+pub async fn listen_console(
+    bind_addr: Option<IpAddr>,
+    port: u16,
+) -> ResultType<Option<hbb_common::tokio::net::TcpListener>> {
+    match console_addr(bind_addr, port) {
+        Some(addr) => {
+            let listener = hbb_common::tcp::new_listener(addr, true).await?;
+            log::info!("Listening on tcp {} for the console", addr);
+            Ok(Some(listener))
+        }
+        None => Ok(None),
+    }
+}
+
+pub async fn accept_or_pending(
+    listener: Option<&hbb_common::tokio::net::TcpListener>,
+) -> std::io::Result<(hbb_common::tokio::net::TcpStream, SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -324,5 +359,44 @@ mod tests {
         let bind_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let listener = listen_tcp(Some(bind_addr), 0).await.unwrap();
         assert_eq!(listener.local_addr().unwrap().ip(), bind_addr);
+    }
+
+    #[test]
+    fn console_addr_only_when_bind_does_not_cover_ipv4_localhost() {
+        for bind_addr in [
+            None,
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ] {
+            assert_eq!(console_addr(bind_addr, 21117), None);
+        }
+        for bind_addr in [
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            Some("2001:db8::1".parse().unwrap()),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        ] {
+            assert_eq!(
+                console_addr(bind_addr, 21117),
+                Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21117))
+            );
+        }
+    }
+
+    #[hbb_common::tokio::test]
+    async fn console_listener_binds_ipv4_localhost() {
+        let listener = listen_console(Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            listener.local_addr().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert!(listen_console(None, 0).await.unwrap().is_none());
+        assert!(listen_console(Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), 0)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

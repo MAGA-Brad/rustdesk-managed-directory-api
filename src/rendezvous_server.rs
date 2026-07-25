@@ -95,6 +95,7 @@ enum LoopFailure {
     Listener3,
     Listener2,
     Listener,
+    ConsoleListener,
 }
 
 impl RendezvousServer {
@@ -157,6 +158,7 @@ impl RendezvousServer {
         let mut listener = create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
         let mut listener3 = create_tcp_listener(bind_addr, ws_port).await?;
+        let mut listener_console = listen_console(bind_addr, nat_port as _).await?;
         log::info!("Listening on tcp/udp {}", listener.local_addr()?);
         log::info!(
             "Listening on tcp {}, extra port for NAT test",
@@ -206,6 +208,7 @@ impl RendezvousServer {
                         &mut listener,
                         &mut listener2,
                         &mut listener3,
+                        &mut listener_console,
                         &mut socket,
                         &key,
                     )
@@ -222,6 +225,10 @@ impl RendezvousServer {
                     LoopFailure::Listener2 => {
                         drop(listener2);
                         listener2 = create_tcp_listener(bind_addr, nat_port).await?;
+                    }
+                    LoopFailure::ConsoleListener => {
+                        drop(listener_console.take());
+                        listener_console = listen_console(bind_addr, nat_port as _).await?;
                     }
                     LoopFailure::Listener3 => {
                         drop(listener3);
@@ -243,6 +250,7 @@ impl RendezvousServer {
         listener: &mut TcpListener,
         listener2: &mut TcpListener,
         listener3: &mut TcpListener,
+        listener_console: &mut Option<TcpListener>,
         socket: &mut FramedSocket,
         key: &str,
     ) -> LoopFailure {
@@ -291,6 +299,18 @@ impl RendezvousServer {
                         Err(err) => {
                            log::error!("listener2.accept failed: {}", err);
                            return LoopFailure::Listener2;
+                        }
+                    }
+                }
+                res = accept_or_pending(listener_console.as_ref()) => {
+                    match res {
+                        Ok((stream, addr))  => {
+                            stream.set_nodelay(true).ok();
+                            self.handle_listener2(stream, addr).await;
+                        }
+                        Err(err) => {
+                           log::error!("console listener.accept failed: {}", err);
+                           return LoopFailure::ConsoleListener;
                         }
                     }
                 }

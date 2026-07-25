@@ -92,6 +92,7 @@ pub async fn start_with_bind(
             io_loop(
                 crate::common::listen_tcp(bind_addr, port).await?,
                 crate::common::listen_tcp(bind_addr, port2).await?,
+                crate::common::listen_console(bind_addr, port).await?,
                 &key,
             )
             .await;
@@ -332,7 +333,12 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
     res
 }
 
-async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
+async fn io_loop(
+    listener: TcpListener,
+    listener2: TcpListener,
+    listener_console: Option<TcpListener>,
+    key: &str,
+) {
     check_params();
     let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
     loop {
@@ -357,6 +363,18 @@ async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
                     }
                     Err(err) => {
                        log::error!("listener2.accept failed: {}", err);
+                       break;
+                    }
+                }
+            }
+            res = crate::common::accept_or_pending(listener_console.as_ref()) => {
+                match res {
+                    Ok((stream, addr))  => {
+                        stream.set_nodelay(true).ok();
+                        handle_connection(stream, addr, &limiter, key, false).await;
+                    }
+                    Err(err) => {
+                       log::error!("console listener.accept failed: {}", err);
                        break;
                     }
                 }
