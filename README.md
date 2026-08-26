@@ -1,3 +1,5 @@
+> Yes, I used Claude to act as SSoE for me. It caught quite a few things that I just missed.
+>
 > **Credits & attribution**
 > - This repository is a fork of
 >   [rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server) (AGPL-3.0), the official
