@@ -1,3 +1,4 @@
+> Yes, I used Claude to act as SSoE for me. It caught quite a few things that I just missed.
 > **This fork adds [`directory-api/`](directory-api/)** — a self-hosted device directory, operator
 > enrollment/2FA, audit logging, and admin management API that sits in front of the RustDesk server
 > below. All credit for the RustDesk server itself goes to the upstream
