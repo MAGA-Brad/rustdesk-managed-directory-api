@@ -1,8 +1,17 @@
 # RustDesk Directory API (RDS)
 
-A self-hosted management layer for a private [RustDesk](https://github.com/rustdesk/rustdesk) deployment:
-device enrollment, operator accounts with 2FA, audit logging, relay-access leasing, and an admin
-web UI, sitting in front of your own hbbs/hbbr (rendezvous/relay) server.
+> Built to run alongside a self-hosted [RustDesk](https://github.com/rustdesk/rustdesk) deployment —
+> not affiliated with or endorsed by RustDesk. None of this exists without the RustDesk project: the
+> [client](https://github.com/rustdesk/rustdesk), the
+> [server](https://github.com/rustdesk/rustdesk-server), and the wider self-host ecosystem
+> (https://rustdesk.com/docs/en/self-host/). Full credit to the RustDesk team and contributors — this
+> is original code written to add self-hosted Pro-tier-style management features (enrollment, 2FA,
+> audit logging, relay-access leasing, admin UI) on top of the open-source server, not a modified
+> copy of any RustDesk source.
+
+A self-hosted management layer for a private RustDesk deployment: device enrollment, operator
+accounts with 2FA, audit logging, relay-access leasing, and an admin web UI, sitting in front of
+your own hbbs/hbbr (rendezvous/relay) server.
 
 This directory does not build or run hbbs/hbbr itself — build the `rustdesk-server` source one level
 up (or run a published RustDesk server image) separately, and point `RUSTDESK_SERVER_ADDRESS` at it.

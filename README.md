@@ -1,8 +1,14 @@
-> **This fork adds [`directory-api/`](directory-api/)** — a self-hosted device directory, operator
-> enrollment/2FA, audit logging, and admin management API that sits in front of the RustDesk server
-> below. All credit for the RustDesk server itself goes to the upstream
-> [rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server) project; this fork exists
-> to add fleet-management features on top of it. See `directory-api/README.md` for details.
+> **Credits & attribution**
+> - This repository is a fork of
+>   [rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server) (AGPL-3.0), the official
+>   self-hosted RustDesk rendezvous/relay server. Everything below this notice is unmodified upstream
+>   source — full credit to the RustDesk team and its contributors.
+> - In production this is actually run via the community-maintained security-hardened build published
+>   at [rustdesk-org/rustdesk-server](https://github.com/rustdesk-org/rustdesk-server) rather than a
+>   self-built image; credit to that project and its maintainer(s) as well.
+> - This fork adds [`directory-api/`](directory-api/) — a self-hosted device directory, operator
+>   enrollment/2FA, audit logging, relay-access leasing, and admin management API that sits in front
+>   of the server above. See [`directory-api/README.md`](directory-api/README.md) for details.
 
 # RustDesk Server Program
 
