@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path("/srv/rustdesk-updates")
+RELEASES = ROOT / "releases"
+MANIFESTS = ROOT / "manifests"
+ARCHIVE = ROOT / "archive"
+SOURCE_PATCHES = ROOT / "source-patches"
+SIGNING = ROOT / "signing"
+PRIVATE_KEY = SIGNING / "update-signing-private-key.pem"
+UPSTREAM_REPOSITORY = "rustdesk/rustdesk"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def safe_name(name: str) -> str:
+    if not name or Path(name).name != name:
+        raise RuntimeError(f"Unsafe file name: {name!r}")
+    return name
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, mode)
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
+def sign_payload(payload: bytes) -> bytes:
+    proc = subprocess.run(
+        [
+            "openssl", "pkeyutl", "-sign", "-rawin",
+            "-inkey", str(PRIVATE_KEY),
+        ],
+        input=payload,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "OpenSSL signing failed: "
+            + proc.stderr.decode("utf-8", errors="replace")[:1000]
+        )
+    if len(proc.stdout) != 64:
+        raise RuntimeError(f"Unexpected Ed25519 signature length: {len(proc.stdout)}")
+    return proc.stdout
+
+
+def extract_bundle(bundle: Path, destination: Path) -> None:
+    with tarfile.open(bundle, "r:*") as archive:
+        for member in archive.getmembers():
+            name = member.name.replace("\\", "/")
+            normalized = Path(name)
+            if normalized.is_absolute() or ".." in normalized.parts:
+                raise RuntimeError(f"Unsafe bundle member: {member.name}")
+            if member.issym() or member.islnk():
+                raise RuntimeError(f"Bundle may not contain links: {member.name}")
+        archive.extractall(destination)
+
+
+
+def validate_public_source_base(source_state: dict) -> None:
+    repository = str(source_state.get("repository", "")).strip()
+    if repository != UPSTREAM_REPOSITORY:
+        raise RuntimeError(
+            f"source-state repository must be {UPSTREAM_REPOSITORY!r}; got {repository!r}"
+        )
+
+    base = str(source_state.get("base_commit", "")).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", base):
+        raise RuntimeError("source-state base_commit must be a 40-character Git SHA")
+
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{UPSTREAM_REPOSITORY}/commits/{base}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "RustDesk-Managed-Update-Publisher/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            document = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"unable to prove source-state base_commit exists in public upstream: {exc}"
+        ) from exc
+
+    observed = str(document.get("sha", "")).strip().lower()
+    if observed != base:
+        raise RuntimeError(
+            "public upstream returned a commit identity different from source-state base_commit"
+        )
+
+    custom_files = source_state.get("custom_files")
+    if not isinstance(custom_files, list) or not any(
+        str(item).strip() for item in custom_files
+    ):
+        raise RuntimeError("source-state custom_files must contain the managed patch footprint")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Publish a signed RustDesk managed client bundle")
+    parser.add_argument("--bundle", required=True)
+    parser.add_argument("--channel", choices=["stable", "pilot"], required=True)
+    parser.add_argument("--build-number", type=int, required=True)
+    parser.add_argument("--version", required=True)
+    args = parser.parse_args()
+
+    if args.build_number <= 0:
+        raise RuntimeError("build number must be positive")
+    if not PRIVATE_KEY.is_file():
+        raise RuntimeError(f"Managed-update signing private key is missing: {PRIVATE_KEY}")
+
+    bundle = Path(args.bundle)
+    if not bundle.is_file():
+        raise RuntimeError(f"Bundle not found: {bundle}")
+
+    RELEASES.mkdir(parents=True, exist_ok=True)
+    MANIFESTS.mkdir(parents=True, exist_ok=True)
+    ARCHIVE.mkdir(parents=True, exist_ok=True)
+    SOURCE_PATCHES.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="rustdesk-publish-", dir=str(ROOT / "staging")) as temp:
+        temp_path = Path(temp)
+        extract_bundle(bundle, temp_path)
+
+        installer_candidates = list(temp_path.glob("*.exe"))
+        if len(installer_candidates) != 1:
+            raise RuntimeError(
+                f"Bundle must contain exactly one top-level EXE; found {len(installer_candidates)}"
+            )
+        installer = installer_candidates[0]
+        file_name = safe_name(installer.name)
+
+        required_meta = [
+            temp_path / "main.patch",
+            temp_path / "hbb_common.patch",
+            temp_path / "source-state.json",
+        ]
+        for path in required_meta:
+            if not path.is_file():
+                raise RuntimeError(f"Bundle is missing {path.name}")
+
+        source_state = json.loads((temp_path / "source-state.json").read_text(encoding="utf-8-sig"))
+        if not isinstance(source_state, dict):
+            raise RuntimeError("source-state.json must contain an object")
+        validate_public_source_base(source_state)
+        if int(source_state.get("build_number", -1)) != args.build_number:
+            raise RuntimeError("source-state build number does not match publish arguments")
+        if str(source_state.get("channel", "")) != args.channel:
+            raise RuntimeError("source-state channel does not match publish arguments")
+
+        size = installer.stat().st_size
+        digest = hashlib.sha256(installer.read_bytes()).hexdigest().lower()
+        published_at = now_iso()
+
+        signed_payload = (
+            "rustdesk-managed-update-v1\n"
+            f"channel={args.channel}\n"
+            f"build_number={args.build_number}\n"
+            f"version={args.version}\n"
+            f"file_name={file_name}\n"
+            f"size={size}\n"
+            f"sha256={digest}\n"
+            f"published_at={published_at}\n"
+        ).encode("utf-8")
+
+        signature = base64.b64encode(sign_payload(signed_payload)).decode("ascii")
+        manifest = {
+            "channel": args.channel,
+            "build_number": args.build_number,
+            "version": args.version,
+            "file_name": file_name,
+            "size": size,
+            "sha256": digest,
+            "signature": signature,
+            "published_at": published_at,
+        }
+
+        release_target = RELEASES / file_name
+        if release_target.exists():
+            existing_hash = hashlib.sha256(release_target.read_bytes()).hexdigest().lower()
+            if existing_hash != digest:
+                archive_target = ARCHIVE / (
+                    f"{release_target.stem}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+                    f"{release_target.suffix}"
+                )
+                shutil.move(str(release_target), str(archive_target))
+
+        temp_release = RELEASES / f".{file_name}.new"
+        shutil.copy2(installer, temp_release)
+        os.chmod(temp_release, 0o644)
+        if hashlib.sha256(temp_release.read_bytes()).hexdigest().lower() != digest:
+            temp_release.unlink(missing_ok=True)
+            raise RuntimeError("Release copy hash verification failed")
+        os.replace(temp_release, release_target)
+
+        # Source-maintenance metadata is committed only after the release copy verifies.
+        for meta in required_meta:
+            atomic_write(
+                SOURCE_PATCHES / meta.name,
+                meta.read_bytes(),
+                0o644,
+            )
+
+        atomic_write(
+            SOURCE_PATCHES / "published-release.json",
+            (
+                json.dumps(
+                    {
+                        "channel": args.channel,
+                        "build_number": args.build_number,
+                        "version": args.version,
+                        "file_name": file_name,
+                        "sha256": digest,
+                        "published_at": published_at,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
+            0o644,
+        )
+
+        manifest_bytes = (
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        atomic_write(MANIFESTS / f"{args.channel}.json", manifest_bytes, 0o644)
+
+    print(
+        "PUBLISH_SUCCESS "
+        f"channel={args.channel} build_number={args.build_number} "
+        f"version={args.version} file={file_name} sha256={digest}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"PUBLISH_ERROR {exc}", file=sys.stderr)
+        raise SystemExit(1)

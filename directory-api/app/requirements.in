@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+psycopg[binary,pool]
+pydantic-settings
+pyotp
+PyJWT[crypto]
+qrcode[pil]
+
+segno==1.6.6

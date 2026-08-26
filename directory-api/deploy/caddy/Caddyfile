@@ -1,0 +1,108 @@
+{
+	servers :443 {
+		listener_wrappers {
+			proxy_protocol {
+				timeout 2s
+				allow 203.0.113.10/32  # replace with your edge/load-balancer source IP
+			}
+			tls
+		}
+	}
+}
+
+rd.example.com {
+	encode gzip
+
+	@private_docs path /docs* /redoc* /openapi.json
+	respond @private_docs 404
+
+	@management path /ops /ops/*
+	respond @management 404
+
+	@recovery path /v1/operator-access-resets/setup /v1/operator-access-resets/accept
+	respond @recovery 404
+
+	# Explicit managed-client API allowlist for rd.example.com.
+	@managed_client_api path /v1/device/relay-lease
+	handle @managed_client_api {
+		reverse_proxy 127.0.0.1:21120
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+ops.example.com {
+	tls /etc/caddy/origin/ops-client-origin.pem /etc/caddy/origin/ops-client-origin.key
+	encode gzip
+
+	@private_docs path /docs* /redoc* /openapi.json
+	respond @private_docs 404
+
+	# Management UI only. Managed-client API traffic belongs on client.example.com.
+	@managed_client_api path /v1/enrollment/devices /v1/enrollment/status /v1/device/me /v1/device/heartbeat /v1/device/contact-email /v1/directory /v1/device/relay-lease /v1/device/session-heartbeat /v1/device/connection-event /v1/updates/latest /v1/updates/releases/*
+	respond @managed_client_api 404
+
+	@ops path /ops /ops/*
+	handle @ops {
+		reverse_proxy 127.0.0.1:21120
+	}
+
+	@recovery path /v1/operator-access-resets/setup /v1/operator-access-resets/accept
+	handle @recovery {
+		reverse_proxy 127.0.0.1:21120
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+client.example.com {
+	tls /etc/caddy/origin/ops-client-origin.pem /etc/caddy/origin/ops-client-origin.key
+	encode gzip
+
+	@private_docs path /docs* /redoc* /openapi.json
+	respond @private_docs 404
+
+	@management path /ops /ops/*
+	respond @management 404
+
+	@recovery path /v1/operator-access-resets/setup /v1/operator-access-resets/accept
+	respond @recovery 404
+
+	# Managed-client API only.
+	@managed_client_api path /v1/enrollment/devices /v1/enrollment/status /v1/device/me /v1/device/heartbeat /v1/device/contact-email /v1/directory /v1/device/relay-lease /v1/device/session-heartbeat /v1/device/connection-event /v1/updates/latest /v1/updates/releases/*
+	handle @managed_client_api {
+		reverse_proxy 127.0.0.1:21120
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}

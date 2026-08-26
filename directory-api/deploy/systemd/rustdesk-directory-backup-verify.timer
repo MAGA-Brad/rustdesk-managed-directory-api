@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly RustDesk Directory restore verification
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30:00
+RandomizedDelaySec=20m
+Persistent=true
+Unit=rustdesk-directory-backup-verify.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+DEST="/var/backups/rustdesk-directory"
+OPS="/var/lib/rustdesk-directory-ops"
+STATUS="$OPS/backup-verify.json"
+LOG="/var/log/rustdesk-directory-backup-verify.log"
+DB_CONTAINER="rustdesk-directory-db"
+LOCK="/run/lock/rustdesk-directory-backup-verify.lock"
+
+mkdir -p "$OPS" "$(dirname "$LOCK")"
+chmod 0755 "$OPS"
+exec 9>"$LOCK"
+
+if ! flock -n 9; then
+    exit 0
+fi
+
+latest="$(
+    find "$DEST" -mindepth 1 -maxdepth 1 -type d -name 'daily-*' \
+        -printf '%T@|%p\n' 2>/dev/null |
+    sort -n |
+    tail -n 1 |
+    cut -d'|' -f2-
+)"
+
+write_status() {
+    local state="$1"
+    local detail="$2"
+    local backup_path="${3:-$latest}"
+    python3 - "$STATUS" "$state" "$detail" "$backup_path" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = {
+    "status": sys.argv[2],
+    "detail": sys.argv[3],
+    "backup_path": sys.argv[4] or None,
+    "last_verified_at": datetime.now(timezone.utc).isoformat(),
+}
+tmp = path.with_suffix(".tmp")
+with tmp.open("w", encoding="utf-8") as handle:
+    json.dump(payload, handle, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+PY
+}
+
+fail() {
+    local message="$1"
+    write_status "failed" "$message"
+    printf '%s RESTORE_VERIFY_FAILED backup=%s detail=%s\n' \
+        "$(date -u +%FT%TZ)" "${latest:-none}" "$message" >> "$LOG"
+    echo "ERROR: $message" >&2
+    exit 1
+}
+
+[[ -n "$latest" ]] || fail "No daily RustDesk Directory backup exists"
+[[ -s "$latest/database.dump" ]] || fail "Latest backup database.dump is missing or empty"
+[[ -s "$latest/SHA256SUMS" ]] || fail "Latest backup SHA256SUMS is missing"
+
+(
+    cd "$latest"
+    sha256sum -c SHA256SUMS
+) >/tmp/rustdesk-backup-verify-sha.txt 2>&1 || {
+    cat /tmp/rustdesk-backup-verify-sha.txt >&2 || true
+    fail "Backup checksum verification failed"
+}
+
+DB_IMAGE="$(docker inspect "$DB_CONTAINER" --format '{{.Config.Image}}')"
+[[ -n "$DB_IMAGE" ]] || fail "Unable to determine the PostgreSQL image"
+
+VERIFY_CONTAINER="rustdesk-backup-verify-$$-$RANDOM"
+VERIFY_PASSWORD="$(openssl rand -hex 24)"
+
+cleanup() {
+    docker rm -f "$VERIFY_CONTAINER" >/dev/null 2>&1 || true
+    rm -f /tmp/rustdesk-backup-verify-sha.txt
+}
+trap cleanup EXIT
+
+docker run -d --name "$VERIFY_CONTAINER" \
+    -e POSTGRES_USER=verify \
+    -e POSTGRES_PASSWORD="$VERIFY_PASSWORD" \
+    -e POSTGRES_DB=verify_db \
+    "$DB_IMAGE" >/dev/null
+
+ready=0
+for _ in $(seq 1 60); do
+    if docker exec "$VERIFY_CONTAINER" \
+        pg_isready -U verify -d verify_db >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    sleep 1
+done
+[[ "$ready" == "1" ]] || fail "Temporary PostgreSQL restore container did not become ready"
+
+docker exec -i "$VERIFY_CONTAINER" \
+    pg_restore \
+    -U verify \
+    -d verify_db \
+    --no-owner \
+    --no-privileges \
+    < "$latest/database.dump" \
+    >/tmp/rustdesk-backup-restore.log 2>&1 || {
+        tail -n 100 /tmp/rustdesk-backup-restore.log >&2 || true
+        fail "pg_restore failed"
+    }
+
+required_tables=(
+    directory_instance
+    operator_accounts
+    operator_sessions
+    managed_devices
+    device_credentials
+    audit_events
+    relay_access_leases
+    device_reenrollment_authorizations
+)
+
+for table in "${required_tables[@]}"; do
+    exists="$(
+        docker exec "$VERIFY_CONTAINER" psql -X -Atq \
+            -U verify -d verify_db \
+            -c "SELECT CASE WHEN to_regclass('public.${table}') IS NULL THEN 0 ELSE 1 END;"
+    )"
+    [[ "$exists" == "1" ]] || fail "Restored database is missing table: $table"
+done
+
+instance_count="$(
+    docker exec "$VERIFY_CONTAINER" psql -X -Atq \
+        -U verify -d verify_db \
+        -c "SELECT COUNT(*) FROM directory_instance WHERE singleton=TRUE;"
+)"
+[[ "$instance_count" == "1" ]] || fail "Restored directory_instance singleton validation failed"
+
+owner_count="$(
+    docker exec "$VERIFY_CONTAINER" psql -X -Atq \
+        -U verify -d verify_db \
+        -c "SELECT COUNT(*) FROM operator_accounts WHERE role='owner';"
+)"
+[[ "$owner_count" -ge 1 ]] || fail "Restored database contains no Owner account"
+
+if [[ -s "$latest/DB-COUNTS.tsv" ]]; then
+    while IFS='|' read -r table expected; do
+        [[ -n "$table" ]] || continue
+        actual="$(
+            docker exec "$VERIFY_CONTAINER" psql -X -Atq \
+                -U verify -d verify_db \
+                -c "SELECT COUNT(*) FROM ${table};"
+        )"
+        [[ "$actual" == "$expected" ]] \
+            || fail "Row-count mismatch for ${table}: expected ${expected}, restored ${actual}"
+    done < "$latest/DB-COUNTS.tsv"
+fi
+
+write_status "ok" "Backup restored successfully into an isolated PostgreSQL container"
+printf '%s RESTORE_VERIFY_OK backup=%s\n' \
+    "$(date -u +%FT%TZ)" "$latest" >> "$LOG"
+
+trap - EXIT
+cleanup
+rm -f /tmp/rustdesk-backup-restore.log
+echo "RESTORE_VERIFY_OK backup=$latest"

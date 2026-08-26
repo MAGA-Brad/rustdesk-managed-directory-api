@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+DB_CONTAINER="rustdesk-directory-db"
+SECRETS_FILE="/opt/rustdesk-directory/config/secrets.env"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "ERROR: this emergency recovery command must be run as root." >&2
+    exit 1
+fi
+
+if [[ ! -f "$SECRETS_FILE" ]]; then
+    echo "ERROR: Directory secrets file is missing." >&2
+    exit 1
+fi
+
+owner_count="$(
+    docker exec "$DB_CONTAINER" psql -X -Atq \
+        -U rustdesk_directory -d rustdesk_directory \
+        -c "SELECT COUNT(*) FROM operator_accounts WHERE role='owner';"
+)"
+
+if [[ "$owner_count" != "1" ]]; then
+    echo "ERROR: emergency recovery is allowed only when exactly one Owner account exists." >&2
+    echo "Current Owner account count: $owner_count" >&2
+    echo "Use normal Owner-to-Owner access recovery when multiple Owners exist." >&2
+    exit 1
+fi
+
+owner_row="$(
+    docker exec "$DB_CONTAINER" psql -X -Atq -F '|' \
+        -U rustdesk_directory -d rustdesk_directory \
+        -c "SELECT id,username,display_name,is_active FROM operator_accounts WHERE role='owner' LIMIT 1;"
+)"
+IFS='|' read -r OWNER_ID OWNER_USERNAME OWNER_DISPLAY OWNER_ACTIVE <<< "$owner_row"
+
+echo
+echo "RustDesk Directory SOLE-OWNER EMERGENCY RECOVERY"
+echo "------------------------------------------------"
+echo "Owner: ${OWNER_DISPLAY:-$OWNER_USERNAME} ($OWNER_USERNAME)"
+echo
+echo "This local root-only command will:"
+echo "  - set a new Owner password"
+echo "  - replace the Owner authenticator secret"
+echo "  - clear lockout and re-enable the Owner account"
+echo "  - revoke every existing Owner session"
+echo "  - write an immutable security audit event"
+echo
+read -r -p "Type RECOVER ${OWNER_USERNAME} to continue: " CONFIRM
+if [[ "$CONFIRM" != "RECOVER ${OWNER_USERNAME}" ]]; then
+    echo "Cancelled."
+    exit 1
+fi
+
+read -r -p "Emergency recovery reason: " REASON
+if [[ -z "${REASON// }" ]]; then
+    echo "ERROR: a recovery reason is required." >&2
+    exit 1
+fi
+
+while true; do
+    read -r -s -p "Enter the new Owner password: " OWNER_PASSWORD
+    echo
+    read -r -s -p "Enter it again: " OWNER_PASSWORD_CONFIRM
+    echo
+
+    if [[ "$OWNER_PASSWORD" != "$OWNER_PASSWORD_CONFIRM" ]]; then
+        echo "Passwords did not match. Try again."
+        continue
+    fi
+
+    if (( ${#OWNER_PASSWORD} < 12 )); then
+        echo "Password must contain at least 12 characters."
+        continue
+    fi
+
+    break
+done
+unset OWNER_PASSWORD_CONFIRM
+
+TOTP_ENCRYPTION_SECRET="$(
+    sed -n 's/^TOTP_ENCRYPTION_SECRET=//p' "$SECRETS_FILE" |
+        tail -n 1
+)"
+if [[ -z "$TOTP_ENCRYPTION_SECRET" ]]; then
+    echo "ERROR: TOTP_ENCRYPTION_SECRET is missing." >&2
+    exit 1
+fi
+
+TOTP_SECRET="$(
+    openssl rand 20 |
+        base32 |
+        tr -d '=\n' |
+        tr '[:lower:]' '[:upper:]'
+)"
+
+TOTP_URI="$(
+    python3 - "$OWNER_USERNAME" "$TOTP_SECRET" <<'PY'
+import sys
+from urllib.parse import quote
+
+username = sys.argv[1]
+secret = sys.argv[2]
+issuer = "RustDesk Directory"
+label = f"{issuer}:{username}"
+print(
+    "otpauth://totp/"
+    + quote(label, safe="")
+    + "?secret="
+    + quote(secret, safe="")
+    + "&issuer="
+    + quote(issuer, safe="")
+    + "&algorithm=SHA1&digits=6&period=30"
+)
+PY
+)"
+
+echo
+echo "Replace the RustDesk Directory entry in your authenticator."
+echo
+echo "Account: RustDesk Directory ($OWNER_USERNAME)"
+echo "Secret:  $TOTP_SECRET"
+echo
+echo "Manual setup URI:"
+echo "$TOTP_URI"
+echo
+
+while true; do
+    read -r -p "Enter the current 6-digit code from the NEW authenticator entry: " TOTP_CODE
+
+    if python3 - "$TOTP_SECRET" "$TOTP_CODE" <<'PY'
+import base64
+import hashlib
+import hmac
+import struct
+import sys
+import time
+
+secret_text = sys.argv[1].strip().upper()
+code = sys.argv[2].strip()
+if len(code) != 6 or not code.isdigit():
+    raise SystemExit(1)
+
+padding = "=" * ((8 - len(secret_text) % 8) % 8)
+secret = base64.b32decode(secret_text + padding, casefold=True)
+
+for offset in (-1, 0, 1):
+    counter = int(time.time()) // 30 + offset
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(secret, msg, hashlib.sha1).digest()
+    index = digest[-1] & 0x0F
+    value = (
+        ((digest[index] & 0x7F) << 24)
+        | ((digest[index + 1] & 0xFF) << 16)
+        | ((digest[index + 2] & 0xFF) << 8)
+        | (digest[index + 3] & 0xFF)
+    ) % 1_000_000
+    if hmac.compare_digest(f"{value:06d}", code):
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+    then
+        break
+    fi
+
+    echo "That code did not verify. Try again."
+done
+
+sql_escape() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
+
+P_SQL="$(sql_escape "$OWNER_PASSWORD")"
+TOTP_SQL="$(sql_escape "$TOTP_SECRET")"
+KEY_SQL="$(sql_escape "$TOTP_ENCRYPTION_SECRET")"
+REASON_SQL="$(sql_escape "$REASON")"
+USER_SQL="$(sql_escape "$OWNER_USERNAME")"
+
+unset OWNER_PASSWORD
+unset TOTP_ENCRYPTION_SECRET
+
+cat <<SQL | docker exec -i "$DB_CONTAINER" psql -X -v ON_ERROR_STOP=1 \
+    -U rustdesk_directory -d rustdesk_directory >/dev/null
+BEGIN;
+
+UPDATE operator_accounts
+SET
+    password_hash = crypt('$P_SQL', gen_salt('bf', 12)),
+    totp_secret_ciphertext = pgp_sym_encrypt('$TOTP_SQL', '$KEY_SQL'),
+    totp_enabled = TRUE,
+    totp_confirmed_at = NOW(),
+    password_changed_at = NOW(),
+    must_change_password = FALSE,
+    failed_login_count = 0,
+    locked_until = NULL,
+    is_active = TRUE
+WHERE id = '$OWNER_ID'::uuid
+  AND role = 'owner';
+
+UPDATE operator_sessions
+SET
+    revoked_at = COALESCE(revoked_at, NOW()),
+    revoked_by = COALESCE(revoked_by, '$OWNER_ID'::uuid),
+    revocation_reason = COALESCE(
+        revocation_reason,
+        'sole_owner_emergency_recovery'
+    )
+WHERE account_id = '$OWNER_ID'::uuid;
+
+INSERT INTO audit_events (
+    actor_account_id,
+    event_type,
+    target_type,
+    target_id,
+    source_ip,
+    details
+)
+VALUES (
+    NULL,
+    'operator.emergency_recovery',
+    'operator_account',
+    '$OWNER_ID'::uuid,
+    NULL,
+    jsonb_build_object(
+        'username', '$USER_SQL',
+        'reason', '$REASON_SQL',
+        'method', 'local_root_cli',
+        'password_reset', TRUE,
+        'totp_replaced', TRUE,
+        'sessions_revoked', TRUE
+    )
+);
+
+COMMIT;
+SQL
+
+echo
+echo "SOLE_OWNER_EMERGENCY_RECOVERY_COMPLETE"
+echo "Owner: $OWNER_USERNAME"
+echo "All previous Owner sessions are revoked."
+echo "Sign in to /ops with the new password and the NEW authenticator entry."

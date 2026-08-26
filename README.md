@@ -1,3 +1,9 @@
+> **This fork adds [`directory-api/`](directory-api/)** — a self-hosted device directory, operator
+> enrollment/2FA, audit logging, and admin management API that sits in front of the RustDesk server
+> below. All credit for the RustDesk server itself goes to the upstream
+> [rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server) project; this fork exists
+> to add fleet-management features on top of it. See `directory-api/README.md` for details.
+
 # RustDesk Server Program
 
 [![build](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml/badge.svg)](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml)

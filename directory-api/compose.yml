@@ -1,0 +1,54 @@
+services:
+  database:
+    container_name: rustdesk-directory-db
+    image: docker.io/library/postgres:18.4-alpine3.24
+    environment:
+      POSTGRES_DB: rustdesk_directory
+      POSTGRES_USER: rustdesk_directory
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:?DATABASE_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - ./data/postgres:/var/lib/postgresql
+    networks:
+      - directory-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rustdesk_directory -d rustdesk_directory"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    container_name: rustdesk-directory-api
+    build:
+      context: ./app
+    environment:
+      DATABASE_HOST: database
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: rustdesk_directory
+      DATABASE_USER: rustdesk_directory
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:?DATABASE_PASSWORD is required}
+      TOKEN_SIGNING_SECRET: ${TOKEN_SIGNING_SECRET:?TOKEN_SIGNING_SECRET is required}
+      DEVICE_CREDENTIAL_SECRET: ${DEVICE_CREDENTIAL_SECRET:?DEVICE_CREDENTIAL_SECRET is required}
+      TOTP_ENCRYPTION_SECRET: ${TOTP_ENCRYPTION_SECRET:?TOTP_ENCRYPTION_SECRET is required}
+      FORWARDED_ALLOW_IPS: "172.19.0.1"
+    volumes:
+      - /srv/rustdesk-updates:/srv/rustdesk-updates:ro
+    depends_on:
+      database:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:21120:21120"
+    networks:
+      - directory-internal
+      - directory-edge
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  directory-internal:
+    internal: true
+  directory-edge:

@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+OUT_DIR = Path("/var/lib/rustdesk-directory-ops")
+HEALTH_FILE = OUT_DIR / "health.json"
+STATUS_FILE = OUT_DIR / "status.json"
+RESTORE_FILE = OUT_DIR / "backup-verify.json"
+BACKUPS_DIR = Path("/var/backups/rustdesk-directory")
+SOURCE_STATE = Path(os.environ.get(
+    "RUSTDESK_OPS_SOURCE_STATE",
+    "/srv/rustdesk-updates/source-patches/source-state.json",
+))
+INTERVAL_SECONDS = 10
+UPSTREAM_INTERVAL_SECONDS = 6 * 60 * 60
+OPS_HOSTNAME = os.environ.get("RUSTDESK_OPS_HOSTNAME", "ops.example.com")
+CLIENT_HOSTNAME = os.environ.get("RUSTDESK_CLIENT_HOSTNAME", "client.example.com")
+ORIGIN_CA_BUNDLE = Path(os.environ.get(
+    "RUSTDESK_OPS_ORIGIN_CA_BUNDLE",
+    "/usr/local/share/rustdesk-directory-ops/cloudflare-origin-ca-bundle.pem",
+))
+UPSTREAM_REPO = "rustdesk/rustdesk"
+UPSTREAM_BRANCH = "master"
+
+_last_upstream_at = 0.0
+_cached_upstream: dict[str, Any] = {}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def run(args: list[str], timeout: int = 6, input_text: str | None = None) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            args,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, "", str(exc)
+
+
+def atomic_json(path: Path, value: dict[str, Any]) -> None:
+    OUT_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=".json", dir=OUT_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, 0o644)
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
+def container_running(name: str) -> bool:
+    rc, out, _ = run(["docker", "inspect", "-f", "{{.State.Running}}", name])
+    return rc == 0 and out == "true"
+
+
+def database_health() -> tuple[str, str]:
+    rc, out, err = run([
+        "docker", "inspect", "-f",
+        "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}",
+        "rustdesk-directory-db",
+    ])
+    if rc != 0:
+        return "down", err or "database container is unavailable"
+    if out == "healthy":
+        return "healthy", "PostgreSQL container health check is healthy"
+    if out in {"running", "starting"}:
+        return "degraded", f"PostgreSQL state is {out}"
+    return "down", f"PostgreSQL state is {out or 'unknown'}"
+
+
+def api_health() -> tuple[str, str]:
+    if not container_running("rustdesk-directory-api"):
+        return "down", "Directory API container is not running"
+    rc, out, err = run([
+        "curl", "--silent", "--show-error", "--fail", "--max-time", "4",
+        "http://127.0.0.1:21120/health",
+    ])
+    if rc != 0:
+        return "down", err or "Directory API health request failed"
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return "degraded", "Directory API health JSON was invalid"
+    if data.get("status") == "ok" and data.get("database") == "ok":
+        return "healthy", "Directory API health endpoint returned ok"
+    return "degraded", "Directory API responded but health is not ok"
+
+
+def https_health() -> tuple[str, str]:
+    if not ORIGIN_CA_BUNDLE.is_file():
+        return "down", f"Cloudflare Origin CA bundle is missing: {ORIGIN_CA_BUNDLE}"
+    rc, out, err = run([
+        "curl", "--silent", "--show-error", "--fail", "--max-time", "6",
+        "--cacert", str(ORIGIN_CA_BUNDLE),
+        "--resolve", f"{OPS_HOSTNAME}:443:127.0.0.1",
+        f"https://{OPS_HOSTNAME}/ops",
+    ], timeout=8)
+    if rc != 0:
+        return "down", err or "HTTPS management request failed"
+    if "<title>RustDesk Directory</title>" in out:
+        return "healthy", "TLS and /ops reverse proxy health check succeeded"
+    return "degraded", "HTTPS responded but /ops page was unexpected"
+
+
+def listener(port: int, udp: bool = False) -> bool:
+    rc, out, _ = run(["ss", "-H", "-lun" if udp else "-lnt"])
+    if rc != 0:
+        return False
+    return re.search(rf"(?<!\d):{port}(?:\s|$)", out) is not None
+
+
+def rustdesk_component(
+    container: str,
+    tcp_ports: list[int],
+    udp_ports: list[int] | None = None,
+) -> tuple[str, str]:
+    udp_ports = udp_ports or []
+    if not container_running(container):
+        return "down", f"{container} container is not running"
+    missing = [f"TCP {p}" for p in tcp_ports if not listener(p)]
+    missing += [f"UDP {p}" for p in udp_ports if not listener(p, True)]
+    if missing:
+        return "degraded", "Missing listener(s): " + ", ".join(missing)
+    return "healthy", f"{container} is running with required listeners"
+
+
+def relay_guard_health() -> tuple[str, str]:
+    rc, out, err = run(["systemctl", "is-active", "rustdesk-relay-guard"])
+    if rc != 0 or out != "active":
+        return "down", err or f"relay guard service is {out or 'inactive'}"
+    rc, mode, err = run([
+        "docker", "exec", "rustdesk-directory-db",
+        "psql", "-X", "-Atq", "-U", "rustdesk_directory", "-d", "rustdesk_directory",
+        "-c",
+        "SELECT COALESCE((SELECT setting_value FROM security_settings "
+        "WHERE setting_key='relay_guard_mode'),'enforced');",
+    ])
+    if rc != 0:
+        return "degraded", err or "unable to read relay guard mode"
+    mode = mode.strip()
+    if mode not in {"staged", "enforced"}:
+        return "down", f"relay guard mode is {mode or 'unknown'}"
+    try:
+        applied_mode = Path("/run/rustdesk-relay-guard/mode").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError as exc:
+        return "degraded", f"unable to read applied relay guard mode: {exc}"
+    if applied_mode != mode:
+        return "degraded", (
+            f"relay guard database mode is {mode} but applied mode is "
+            f"{applied_mode or 'unknown'}"
+        )
+    rc, _, err = run(["nft", "list", "table", "inet", "rustdesk_guard"])
+    if rc != 0:
+        return "down", err or "rustdesk_guard nftables table is missing"
+    if mode == "staged":
+        return "degraded", (
+            "service active, STAGED mode applied and synchronized; "
+            "nftables guard is present but enforcement is not enabled"
+        )
+    return "healthy", (
+        "service active, ENFORCED mode applied and synchronized; "
+        "nftables guard present"
+    )
+
+
+def critical_status() -> dict[str, Any]:
+    checks = {
+        "api": api_health,
+        "database": database_health,
+        "https": https_health,
+        "id_server": lambda: rustdesk_component(
+            "rustdesk-hbbs", [21115, 21116, 21118], [21116]
+        ),
+        "relay": lambda: rustdesk_component("rustdesk-hbbr", [21117, 21119]),
+        "relay_guard": relay_guard_health,
+    }
+    services: dict[str, dict[str, str]] = {}
+    for name, check in checks.items():
+        try:
+            status, detail = check()
+        except Exception as exc:
+            status, detail = "unknown", f"health check exception: {exc}"
+        services[name] = {"status": status, "detail": detail}
+    statuses = [item["status"] for item in services.values()]
+    overall = "healthy" if statuses and all(v == "healthy" for v in statuses) else "degraded"
+    return {"status": overall, "generated_at": now_iso(), "services": services}
+
+
+def latest_backup() -> dict[str, Any]:
+    if not BACKUPS_DIR.exists():
+        return {"status": "missing"}
+    candidates = [
+        item
+        for item in BACKUPS_DIR.glob("daily-*")
+        if item.is_dir() and (item / "database.dump").is_file()
+    ]
+    if not candidates:
+        return {"status": "missing"}
+    latest = max(candidates, key=lambda item: item.stat().st_mtime)
+    age = max(0, time.time() - latest.stat().st_mtime)
+    return {
+        "status": "ok",
+        "path": str(latest),
+        "age_seconds": int(age),
+        "database_dump_bytes": (latest / "database.dump").stat().st_size,
+        "sha256sums_present": (latest / "SHA256SUMS").is_file(),
+    }
+
+
+def restore_status() -> dict[str, Any]:
+    try:
+        data = json.loads(RESTORE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"status": "not-run"}
+
+
+def _local_origin_tls_status(hostname: str, purpose: str) -> dict[str, Any]:
+    try:
+        if not ORIGIN_CA_BUNDLE.is_file():
+            return {
+                "status": "error",
+                "detail": f"Cloudflare Origin CA bundle is missing: {ORIGIN_CA_BUNDLE}",
+            }
+        context = ssl.create_default_context(cafile=str(ORIGIN_CA_BUNDLE))
+        with socket.create_connection(("127.0.0.1", 443), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname=hostname) as wrapped:
+                der = wrapped.getpeercert(binary_form=True)
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        with tempfile.NamedTemporaryFile("w", encoding="ascii", delete=False) as handle:
+            handle.write(pem)
+            cert_path = handle.name
+        try:
+            decoded = ssl._ssl._test_decode_cert(cert_path)
+        finally:
+            os.unlink(cert_path)
+        raw_not_after = str(decoded.get("notAfter", ""))
+        expires = datetime.strptime(raw_not_after, "%b %d %H:%M:%S %Y %Z").replace(
+            tzinfo=timezone.utc
+        )
+        days = int((expires - datetime.now(timezone.utc)).total_seconds() // 86400)
+
+        def cert_name(parts: Any) -> str | None:
+            values = []
+            for group in parts or ():
+                for key, value in group:
+                    if key in {"commonName", "organizationName"}:
+                        values.append(str(value))
+            return " / ".join(values) if values else None
+
+        return {
+            "status": "ok" if days >= 14 else "warning",
+            "purpose": purpose,
+            "hostname": hostname,
+            "trust_bundle": str(ORIGIN_CA_BUNDLE),
+            "days_remaining": days,
+            "not_after": expires.isoformat().replace("+00:00", "Z"),
+            "subject": cert_name(decoded.get("subject")),
+            "issuer": cert_name(decoded.get("issuer")),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "purpose": purpose,
+            "hostname": hostname,
+            "detail": str(exc),
+        }
+
+
+def tls_status() -> dict[str, Any]:
+    return _local_origin_tls_status(
+        OPS_HOSTNAME,
+        "Directory /ops origin HTTPS",
+    )
+
+
+def client_tls_status() -> dict[str, Any]:
+    purpose = "Managed client API public HTTPS"
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((CLIENT_HOSTNAME, 443), timeout=6) as raw:
+            with context.wrap_socket(raw, server_hostname=CLIENT_HOSTNAME) as wrapped:
+                der = wrapped.getpeercert(binary_form=True)
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="ascii", delete=False
+        ) as handle:
+            handle.write(pem)
+            cert_path = handle.name
+        try:
+            decoded = ssl._ssl._test_decode_cert(cert_path)
+        finally:
+            os.unlink(cert_path)
+
+        raw_not_after = str(decoded.get("notAfter", ""))
+        expires = datetime.strptime(
+            raw_not_after, "%b %d %H:%M:%S %Y %Z"
+        ).replace(tzinfo=timezone.utc)
+        days = int(
+            (expires - datetime.now(timezone.utc)).total_seconds() // 86400
+        )
+
+        def cert_name(parts: Any) -> str | None:
+            values = []
+            for group in parts or ():
+                for key, value in group:
+                    if key in {"commonName", "organizationName"}:
+                        values.append(str(value))
+            return " / ".join(values) if values else None
+
+        return {
+            "status": "ok" if days >= 14 else "warning",
+            "purpose": purpose,
+            "hostname": CLIENT_HOSTNAME,
+            "trust": "system default trust store",
+            "validation_path": "public DNS / client-facing HTTPS",
+            "days_remaining": days,
+            "not_after": expires.isoformat().replace("+00:00", "Z"),
+            "subject": cert_name(decoded.get("subject")),
+            "issuer": cert_name(decoded.get("issuer")),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "purpose": purpose,
+            "hostname": CLIENT_HOSTNAME,
+            "validation_path": "public DNS / client-facing HTTPS",
+            "detail": str(exc),
+        }
+
+def disk_status() -> dict[str, Any]:
+    usage = shutil.disk_usage("/")
+    free_percent = 100.0 * usage.free / usage.total if usage.total else 0.0
+    return {
+        "status": "ok" if free_percent >= 10 else "warning",
+        "free_percent": round(free_percent, 2),
+        "free_bytes": usage.free,
+        "total_bytes": usage.total,
+    }
+
+
+def rustdesk_status() -> dict[str, Any]:
+    def version(container: str, binary: str) -> str:
+        rc, out, _ = run(["docker", "exec", container, binary, "--version"])
+        return out.splitlines()[-1] if rc == 0 and out else "unknown"
+
+    rc, image, _ = run(["docker", "inspect", "-f", "{{.Config.Image}}", "rustdesk-hbbs"])
+    image = image if rc == 0 else ""
+    return {
+        "status": "ok" if image else "unknown",
+        "hbbs_version": version("rustdesk-hbbs", "hbbs"),
+        "hbbr_version": version("rustdesk-hbbr", "hbbr"),
+        "image_reference": image,
+        "image_pinned": "@sha256:" in image,
+    }
+
+
+def github_json(url: str, timeout: int = 15) -> Any:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "RustDesk-Ops-Upstream-Assessment/1.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def normalize_custom_file(value: str) -> str:
+    return value.replace("\\", "/").strip()
+
+
+def upstream_status() -> dict[str, Any]:
+    try:
+        source_state = json.loads(SOURCE_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "status": "unavailable",
+            "assessment": "Review recommended",
+            "reasons": [f"Source-state metadata is unavailable: {exc}"],
+        }
+
+    base = str(source_state.get("base_commit", "")).strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", base):
+        return {
+            "status": "unavailable",
+            "assessment": "Review recommended",
+            "reasons": ["Current custom base commit is missing or invalid"],
+        }
+
+    try:
+        compare = github_json(
+            f"https://api.github.com/repos/{UPSTREAM_REPO}/compare/{base}...{UPSTREAM_BRANCH}"
+        )
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "assessment": "Review recommended",
+            "base_commit": base,
+            "upstream_ref": UPSTREAM_BRANCH,
+            "reasons": [f"GitHub compare check failed: {exc}"],
+        }
+
+    try:
+        release = github_json(f"https://api.github.com/repos/{UPSTREAM_REPO}/releases/latest")
+        latest_release = str(release.get("tag_name", "")) or None
+    except Exception:
+        latest_release = None
+
+    new_commits = int(compare.get("ahead_by", compare.get("total_commits", 0)) or 0)
+    changed_files = {
+        str(item.get("filename", ""))
+        for item in (compare.get("files") or [])
+        if isinstance(item, dict) and item.get("filename")
+    }
+    custom_files = {
+        normalize_custom_file(str(item))
+        for item in (source_state.get("custom_files") or [])
+        if str(item).strip()
+    }
+
+    # Map upstream changed files back to the configured custom path footprint.
+    # Patch clean/review counts measure CUSTOM paths rather than raw upstream
+    # files, so one wildcard path cannot count as many independent patches.
+    exact_custom = {item for item in custom_files if not item.endswith("/**")}
+    wildcard_roots = {
+        item: item[:-3].rstrip("/")
+        for item in custom_files
+        if item.endswith("/**")
+    }
+
+    def custom_path_overlaps(custom_path: str) -> bool:
+        if custom_path.endswith("/**"):
+            root = wildcard_roots[custom_path]
+            return any(
+                changed == root or changed.startswith(root + "/")
+                for changed in changed_files
+            )
+        return custom_path in changed_files
+
+    overlap_custom_paths = {
+        item for item in custom_files if custom_path_overlaps(item)
+    }
+    overlaps = {
+        item for item in changed_files
+        if item in exact_custom
+        or any(
+            item == root or item.startswith(root + "/")
+            for root in wildcard_roots.values()
+        )
+    }
+    clean_count = max(0, len(custom_files) - len(overlap_custom_paths))
+    review_count = len(overlap_custom_paths)
+
+    commit_text = " ".join(
+        str(item.get("commit", {}).get("message", "")).lower()
+        for item in (compare.get("commits") or [])
+        if isinstance(item, dict)
+    )
+    changed_text = " ".join(changed_files).lower()
+
+    high_impact_terms = (
+        "security", "cve", "vulnerability", "auth", "authentication",
+        "rendezvous", "relay", "hbbs", "hbbr", "protocol", "windows",
+        "installer", "updater", "update", "flutter", "dependency",
+    )
+    high_impact = any(term in commit_text or term in changed_text for term in high_impact_terms)
+
+    reasons: list[str] = []
+    if new_commits == 0:
+        assessment = "No action"
+        reasons.append("Custom base is not behind upstream master.")
+    elif review_count > 0:
+        assessment = "Rebuild recommended"
+        reasons.append(
+            f"{review_count} customized source path(s) overlap upstream changes."
+        )
+    elif high_impact:
+        assessment = "Rebuild recommended"
+        reasons.append(
+            "Upstream changes touch security, Windows, protocol, relay, updater, or other high-impact areas."
+        )
+    else:
+        assessment = "Review recommended"
+        reasons.append(
+            f"Upstream master is {new_commits} commit(s) ahead; no customized-path overlap was detected."
+        )
+
+    if latest_release:
+        reasons.append(f"Latest published RustDesk release: {latest_release}.")
+    if len(changed_files) >= 300:
+        reasons.append(
+            "GitHub compare file listing reached a large size; overlap assessment may require manual review."
+        )
+
+    return {
+        "status": "ok",
+        "assessment": assessment,
+        "upstream_ref": UPSTREAM_BRANCH,
+        "latest_release": latest_release,
+        "base_commit": base,
+        "base_kind": source_state.get("base_kind"),
+        "custom_head_commit": source_state.get("custom_head_commit"),
+        "new_commits": new_commits,
+        "changed_files_count": len(changed_files),
+        "customized_files_count": len(custom_files),
+        "patch_clean_count": clean_count,
+        "patch_review_count": review_count,
+        "overlap_custom_paths": sorted(overlap_custom_paths)[:100],
+        "overlap_files": sorted(overlaps)[:100],
+        "reasons": reasons,
+        "generated_at": now_iso(),
+    }
+
+
+def operations_status(critical: dict[str, Any]) -> dict[str, Any]:
+    services = critical.get("services", {})
+    service_summary = {
+        "directory_api": "ok" if services.get("api", {}).get("status") == "healthy" else "error",
+        "database": (
+            "healthy"
+            if services.get("database", {}).get("status") == "healthy"
+            else "error"
+        ),
+        "relay_guard": (
+            "enforced"
+            if services.get("relay_guard", {}).get("status") == "healthy"
+            else (
+                "staged"
+                if services.get("relay_guard", {}).get("status") == "degraded"
+                and "STAGED" in services.get("relay_guard", {}).get("detail", "")
+                else "inactive"
+            )
+        ),
+    }
+    return {
+        "status": critical.get("status", "unknown"),
+        "generated_at": now_iso(),
+        "services": service_summary,
+        "backup": latest_backup(),
+        "restore_verification": restore_status(),
+        "tls": tls_status(),
+        "client_tls": client_tls_status(),
+        "disk": disk_status(),
+        "rustdesk": rustdesk_status(),
+        "upstream": _cached_upstream,
+    }
+
+
+def main() -> int:
+    global _last_upstream_at, _cached_upstream
+    while True:
+        try:
+            critical = critical_status()
+            atomic_json(HEALTH_FILE, critical)
+
+            now = time.monotonic()
+            if not _cached_upstream or now - _last_upstream_at >= UPSTREAM_INTERVAL_SECONDS:
+                _cached_upstream = upstream_status()
+                _last_upstream_at = now
+
+            atomic_json(STATUS_FILE, operations_status(critical))
+        except Exception as exc:
+            print(f"{now_iso()} collector error: {exc}", flush=True)
+        time.sleep(INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

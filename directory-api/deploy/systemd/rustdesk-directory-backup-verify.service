@@ -1,0 +1,16 @@
+[Unit]
+Description=Verify RustDesk Directory backup by isolated PostgreSQL restore
+Requires=docker.service
+After=docker.service network-online.target rustdesk-directory-backup.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rustdesk-directory-backup-verify
+User=root
+Group=root
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+PrivateTmp=true
+NoNewPrivileges=true

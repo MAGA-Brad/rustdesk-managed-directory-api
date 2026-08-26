@@ -1,0 +1,26 @@
+[Unit]
+Description=RustDesk health and upstream status collector
+After=docker.service caddy.service rustdesk-relay-guard.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/rustdesk-health-collector
+Restart=always
+RestartSec=3s
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+RuntimeDirectory=rustdesk-health-collector
+RuntimeDirectoryMode=0750
+Environment=HOME=/run/rustdesk-health-collector
+ProtectHome=read-only
+ProtectSystem=strict
+ReadOnlyPaths=/srv/rustdesk-updates
+ReadWritePaths=/var/lib/rustdesk-directory-ops
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

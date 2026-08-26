@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+DB_CONTAINER="rustdesk-directory-db"
+TABLE="rustdesk_guard"
+STATE_DIR="/run/rustdesk-relay-guard"
+MODE_FILE="$STATE_DIR/mode"
+SYNC_INTERVAL=2
+SET_TIMEOUT="30s"
+
+mkdir -p "$STATE_DIR"
+
+log() {
+  printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"
+}
+
+sql() {
+  docker exec "$DB_CONTAINER" psql -X -Atq \
+    -U rustdesk_directory -d rustdesk_directory \
+    -c "$1"
+}
+
+read_mode() {
+  local value
+  if ! value="$(sql "SELECT COALESCE((SELECT setting_value FROM security_settings WHERE setting_key='relay_guard_mode'),'enforced');" 2>/dev/null)"; then
+    return 1
+  fi
+  case "$value" in
+    enforced|staged) printf '%s' "$value" ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_fail_safe_table() {
+  if nft list table inet "$TABLE" >/dev/null 2>&1; then
+    return 0
+  fi
+  log "firewall table missing; applying ENFORCED fail-safe"
+  install_table "enforced"
+}
+
+install_table() {
+  local mode="$1"
+  nft delete table inet "$TABLE" >/dev/null 2>&1 || true
+  if [[ "$mode" == "enforced" ]]; then
+    nft -f - <<NFT
+ table inet $TABLE {
+   set allowed_v4 {
+     type ipv4_addr
+     flags timeout
+     timeout $SET_TIMEOUT
+     gc-interval 10s
+   }
+   set allowed_v6 {
+     type ipv6_addr
+     flags timeout
+     timeout $SET_TIMEOUT
+     gc-interval 10s
+   }
+   chain input {
+     type filter hook input priority -10; policy accept;
+     iifname "lo" tcp dport { 21115, 21116, 21117, 21118, 21119, 21120 } accept
+     iifname "lo" udp dport 21116 accept
+     tcp dport 21120 counter drop
+     ip saddr @allowed_v4 tcp dport { 21115, 21116, 21117, 21118, 21119 } counter accept
+     ip6 saddr @allowed_v6 tcp dport { 21115, 21116, 21117, 21118, 21119 } counter accept
+     tcp dport { 21118, 21119 } counter drop
+     ip saddr @allowed_v4 udp dport 21116 counter accept
+     ip6 saddr @allowed_v6 udp dport 21116 counter accept
+     tcp dport { 21115, 21116, 21117 } limit rate 5/minute burst 10 packets log prefix "RD-GUARD TCP "
+     tcp dport { 21115, 21116, 21117 } counter drop
+     udp dport 21116 limit rate 5/minute burst 10 packets log prefix "RD-GUARD UDP "
+     udp dport 21116 counter drop
+   }
+ }
+NFT
+  else
+    nft -f - <<NFT
+ table inet $TABLE {
+   set allowed_v4 {
+     type ipv4_addr
+     flags timeout
+     timeout $SET_TIMEOUT
+     gc-interval 10s
+   }
+   set allowed_v6 {
+     type ipv6_addr
+     flags timeout
+     timeout $SET_TIMEOUT
+     gc-interval 10s
+   }
+   chain input {
+     type filter hook input priority -10; policy accept;
+     iifname "lo" tcp dport { 21118, 21119, 21120 } accept
+     tcp dport 21120 counter drop
+     tcp dport { 21118, 21119, 21120 } counter drop
+   }
+ }
+NFT
+  fi
+  printf '%s' "$mode" > "$MODE_FILE"
+  log "relay guard mode applied: $mode"
+}
+
+sync_sets() {
+  local now_sql rows ip family
+  now_sql="now()"
+  rows="$(sql "
+    SELECT DISTINCT host(l.source_ip) || '|' || family(l.source_ip)
+    FROM relay_access_leases l
+    JOIN managed_devices d ON d.id=l.device_id
+    JOIN device_credentials c
+      ON c.device_id=d.id
+     AND c.credential_serial=l.credential_serial
+    WHERE l.revoked_at IS NULL
+      AND l.expires_at > $now_sql
+      AND d.status='approved'
+      AND c.revoked_at IS NULL
+      AND (c.expires_at IS NULL OR c.expires_at > $now_sql)
+    ORDER BY 1;
+  " 2>/dev/null || true)"
+
+  local nft_batch
+  nft_batch="flush set inet $TABLE allowed_v4
+flush set inet $TABLE allowed_v6
+"
+  while IFS='|' read -r ip family; do
+    [[ -z "${ip:-}" ]] && continue
+    if [[ "$family" == "4" ]]; then
+      nft_batch+="add element inet $TABLE allowed_v4 { $ip }"$'\n'
+    elif [[ "$family" == "6" ]]; then
+      nft_batch+="add element inet $TABLE allowed_v6 { $ip }"$'\n'
+    fi
+  done <<< "$rows"
+  printf '%s' "$nft_batch" | nft -f -
+}
+
+cleanup_expired() {
+  sql "DELETE FROM relay_access_leases WHERE expires_at < now() - interval '1 day' OR revoked_at < now() - interval '1 day';" >/dev/null 2>&1 || true
+}
+
+log "relay guard synchronizer starting"
+last_cleanup=0
+while true; do
+  if ! docker inspect "$DB_CONTAINER" >/dev/null 2>&1; then
+    ensure_fail_safe_table
+    sleep "$SYNC_INTERVAL"
+    continue
+  fi
+
+  current_mode="$(cat "$MODE_FILE" 2>/dev/null || true)"
+
+  if mode="$(read_mode)"; then
+    if [[ "$mode" != "$current_mode" ]] || ! nft list table inet "$TABLE" >/dev/null 2>&1; then
+      install_table "$mode"
+    fi
+
+    if ! sync_sets; then
+      log "lease set synchronization failed; retrying"
+    fi
+  else
+    log "database mode lookup failed; preserving current firewall state"
+    ensure_fail_safe_table
+  fi
+
+  now_epoch="$(date +%s)"
+  if (( now_epoch - last_cleanup >= 3600 )); then
+    cleanup_expired
+    last_cleanup="$now_epoch"
+  fi
+
+  sleep "$SYNC_INTERVAL"
+done

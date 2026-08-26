@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+nft delete table inet rustdesk_host 2>/dev/null || true
+
+nft -f - <<'NFT'
+table inet rustdesk_host {
+    chain input {
+        type filter hook input priority -5; policy accept;
+
+        ct state established,related accept
+        iifname "lo" accept
+
+        ip saddr 192.168.1.0/24 tcp dport 22 accept  # replace with your own trusted SSH source range
+        tcp dport 22 counter drop
+    }
+}
+NFT
