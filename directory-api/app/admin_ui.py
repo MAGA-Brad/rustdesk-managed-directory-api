@@ -836,6 +836,43 @@ def register_admin_routes(
             "generated_at": now,
         }
 
+    def host_metrics_snapshot(hostname: str) -> dict[str, Any] | None:
+        # Full-detail host metrics (per-drive wear/SMART/temp, ZFS pool,
+        # host CPU/memory/disk/versions) pushed by a watcher script running
+        # ON that host - see main.py's internal_host_metrics. Read directly
+        # here (the API already has a DB connection) rather than routed
+        # through status.json, which is RDS's own local collector's file
+        # and has no way to receive data from a different physical host.
+        # A "healthy vs. not" summary of this SAME data also gets folded
+        # into status.json's own "host" service entry by
+        # rustdesk-health-collector (via docker exec + psql, matching how
+        # it already reads other DB state) - that summary drives the
+        # Server Health panel's overall badge/alerting, this call supplies
+        # the full breakdown for display.
+        with open_database_handler() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload, updated_at FROM host_metrics WHERE hostname = %s",
+                    (hostname,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        age_seconds = max(
+            0.0,
+            (datetime.now(timezone.utc) - row["updated_at"]).total_seconds(),
+        )
+        return {
+            **row["payload"],
+            "updated_at": row["updated_at"].isoformat(),
+            "age_seconds": age_seconds,
+            # The prox watcher's own timer runs every 5 minutes - anything
+            # much older than that means the watcher itself has stopped
+            # reporting, which is worth surfacing distinctly from "this
+            # one metric looks bad".
+            "stale": age_seconds > 900,
+        }
+
     @app.get(
         f"{ADMIN_PATH}/api/system-health",
         include_in_schema=False,
@@ -864,21 +901,22 @@ def register_admin_routes(
             )
             data["age_seconds"] = age_seconds
             data["stale"] = age_seconds > 45
-            return data
         except FileNotFoundError:
-            return {
+            data = {
                 "status": "unavailable",
                 "stale": True,
                 "services": {},
                 "detail": "Critical service health has not been generated yet",
             }
         except (OSError, ValueError, json.JSONDecodeError):
-            return {
+            data = {
                 "status": "error",
                 "stale": True,
                 "services": {},
                 "detail": "Critical service health could not be read",
             }
+
+        return data
 
     @app.get(
         f"{ADMIN_PATH}/api/operations",
@@ -899,17 +937,23 @@ def register_admin_routes(
             )
             if not isinstance(data, dict):
                 raise ValueError("status document is not an object")
-            return data
         except FileNotFoundError:
-            return {
+            data = {
                 "status": "unavailable",
                 "detail": "Host operations status has not been generated yet",
             }
         except (OSError, ValueError, json.JSONDecodeError):
-            return {
+            data = {
                 "status": "error",
                 "detail": "Host operations status could not be read",
             }
+
+        try:
+            data["host_metrics"] = host_metrics_snapshot("prox")
+        except Exception:
+            data["host_metrics"] = None
+
+        return data
 
     @app.get(
         f"{ADMIN_PATH}/api/devices",
@@ -1847,12 +1891,24 @@ ADMIN_HTML = r"""<!doctype html>
       gap: 20px;
       margin-bottom: 18px;
     }
+    .actions-col {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
+    }
     .actions {
       display: flex;
       gap: 9px;
       align-items: center;
       flex-wrap: wrap;
     }
+    .topbar-link {
+      color: var(--accent);
+      font-size: 12px;
+      text-decoration: none;
+    }
+    .topbar-link:hover { text-decoration: underline; }
     .operator {
       color: var(--muted);
       font-size: 13px;
@@ -1931,7 +1987,7 @@ ADMIN_HTML = r"""<!doctype html>
       letter-spacing: .08em;
     }
     #clientStats {
-      grid-template-columns: repeat(7, minmax(0, 1fr));
+      grid-template-columns: 1fr 1fr 1fr 1fr 1.25fr 1fr;
       gap: 9px;
     }
     #clientStats .stat {
@@ -2087,13 +2143,6 @@ ADMIN_HTML = r"""<!doctype html>
       background: linear-gradient(135deg, #278df8, #6467f2);
       border-color: transparent;
     }
-    .dashboard-panel { margin-top: 22px; }
-    .dash-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 16px;
-      margin-top: 6px;
-    }
     .dash-card {
       border: 1px solid var(--line);
       border-radius: 16px;
@@ -2107,33 +2156,12 @@ ADMIN_HTML = r"""<!doctype html>
       text-transform: uppercase;
       letter-spacing: .04em;
     }
-    .dash-card-wide { grid-column: 1 / -1; }
-    .dist-row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 9px;
-      font-size: 13px;
-    }
-    .dist-row:last-child { margin-bottom: 0; }
-    .dist-label { width: 74px; color: var(--muted); flex: none; }
-    .dist-bar {
-      flex: 1;
-      height: 8px;
-      border-radius: 999px;
-      background: var(--panel-2);
-      overflow: hidden;
-    }
-    .dist-fill { height: 100%; border-radius: 999px; }
-    .dist-fill.approved { background: var(--good); }
-    .dist-fill.pending { background: var(--warn); }
-    .dist-fill.blocked, .dist-fill.revoked, .dist-fill.denied { background: var(--bad); }
-    .dist-count { width: 28px; text-align: right; flex: none; font-weight: 700; }
     .dash-stat-grid {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
       gap: 14px;
     }
+    .dash-stat-grid-3 { grid-template-columns: repeat(3, 1fr); }
     .dash-stat-value {
       font-size: 26px;
       font-weight: 800;
@@ -2144,25 +2172,6 @@ ADMIN_HTML = r"""<!doctype html>
       color: var(--muted);
       font-size: 12px;
       margin-top: 2px;
-    }
-    .trend-svg {
-      width: 100%;
-      height: 240px;
-      display: block;
-    }
-    .trend-legend {
-      display: flex;
-      gap: 16px;
-      margin-top: 8px;
-      font-size: 12px;
-      color: var(--muted);
-    }
-    .trend-legend .swatch {
-      display: inline-block;
-      width: 9px;
-      height: 9px;
-      border-radius: 2px;
-      margin-right: 5px;
     }
     .dash-table-wrap { margin-top: 20px; }
     .dash-table-title {
@@ -2480,21 +2489,6 @@ ADMIN_HTML = r"""<!doctype html>
       font-size: 12px;
       line-height: 1.45;
     }
-    .ops-primary-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 18px;
-      align-items: start;
-    }
-    .ops-primary-grid > .panel {
-      min-width: 0;
-      margin: 0;
-    }
-    @media (max-width: 1180px) {
-      .ops-primary-grid {
-        grid-template-columns: 1fr;
-      }
-    }
     @media (max-width: 760px) {
       .ops-status-groups {
         grid-template-columns: 1fr;
@@ -2599,31 +2593,39 @@ ADMIN_HTML = r"""<!doctype html>
             <p>Client, operator, and server health management</p>
           </div>
         </div>
-        <div class="actions">
-          <span id="criticalHealth" class="health-strip" aria-label="Critical service health">
-            <span class="health-pill" data-health="api"><span class="dot unknown"></span><span>API</span></span>
-            <span class="health-pill" data-health="database"><span class="dot unknown"></span><span>DB</span></span>
-            <span class="health-pill" data-health="https"><span class="dot unknown"></span><span>HTTPS</span></span>
-            <span class="health-pill" data-health="id_server"><span class="dot unknown"></span><span>ID Server</span></span>
-            <span class="health-pill" data-health="relay"><span class="dot unknown"></span><span>Relay</span></span>
-            <span class="health-pill" data-health="relay_guard"><span class="dot unknown"></span><span>Relay Guard</span></span>
-          </span>
-          <span id="operatorText" class="operator"></span>
-          <button
-            id="myAccountButton"
-            class="secondary"
-            type="button"
-          >My Account</button>
-          <button
-            id="refreshButton"
-            class="secondary"
-            type="button"
-          >Refresh</button>
-          <button
-            id="logoutButton"
-            class="secondary"
-            type="button"
-          >Sign out</button>
+        <div class="actions-col">
+          <div class="actions">
+            <span id="criticalHealth" class="health-strip" aria-label="Critical service health">
+              <span class="health-pill" data-health="api"><span class="dot unknown"></span><span>API</span></span>
+              <span class="health-pill" data-health="database"><span class="dot unknown"></span><span>DB</span></span>
+              <span class="health-pill" data-health="https"><span class="dot unknown"></span><span>HTTPS</span></span>
+              <span class="health-pill" data-health="id_server"><span class="dot unknown"></span><span>ID Server</span></span>
+              <span class="health-pill" data-health="relay"><span class="dot unknown"></span><span>Relay</span></span>
+              <span class="health-pill" data-health="relay_guard"><span class="dot unknown"></span><span>Relay Guard</span></span>
+            </span>
+            <span id="operatorText" class="operator"></span>
+            <button
+              id="myAccountButton"
+              class="secondary"
+              type="button"
+            >My Account</button>
+            <button
+              id="refreshButton"
+              class="secondary"
+              type="button"
+            >Refresh</button>
+            <button
+              id="logoutButton"
+              class="secondary"
+              type="button"
+            >Sign out</button>
+          </div>
+          <a
+            href="https://github.com/MAGA-Brad?tab=repositories"
+            target="_blank"
+            rel="noopener"
+            class="topbar-link"
+          >Github Repo</a>
         </div>
       </header>
 
@@ -2651,6 +2653,38 @@ ADMIN_HTML = r"""<!doctype html>
           <article class="stat"><div id="activeClientCount" class="value">0</div><div class="label">Active Clients</div></article>
           <article class="stat"><div id="pendingCount" class="value">0</div><div class="label">Pending</div></article>
           <article class="stat"><div id="activeSessionCount" class="value">0</div><div class="label">Active Sessions</div></article>
+
+          <div class="dash-card">
+            <h3>Established Connections</h3>
+            <div class="dash-stat-grid dash-stat-grid-3">
+              <div class="dash-stat">
+                <div id="conn24Established" class="dash-stat-value good">0</div>
+                <div class="dash-stat-label">Last 24h</div>
+              </div>
+              <div class="dash-stat">
+                <div id="connections7d" class="dash-stat-value good">0</div>
+                <div class="dash-stat-label">Last 7 days</div>
+              </div>
+              <div class="dash-stat">
+                <div id="connectionsLifetime" class="dash-stat-value good">0</div>
+                <div class="dash-stat-label">Lifetime</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="dash-card">
+            <h3>Messages Sent</h3>
+            <div class="dash-stat-grid">
+              <div class="dash-stat">
+                <div id="messages7d" class="dash-stat-value good">0</div>
+                <div class="dash-stat-label">Last 7 days</div>
+              </div>
+              <div class="dash-stat">
+                <div id="messagesLifetime" class="dash-stat-value good">0</div>
+                <div class="dash-stat-label">Lifetime</div>
+              </div>
+            </div>
+          </div>
         </section>
 
         <section class="panel">
@@ -2674,6 +2708,12 @@ ADMIN_HTML = r"""<!doctype html>
                 type="button"
               >Authorize re-enrollment</button>
               <button
+                id="requestAllLogsButton"
+                class="secondary brad-only"
+                type="button"
+                title="Force every approved client to upload a fresh debug log on its next check-in, bypassing the normal 24-hour cadence"
+              >Request logs from all clients</button>
+              <button
                 id="exportClientsButton"
                 class="secondary"
                 type="button"
@@ -2685,15 +2725,15 @@ ADMIN_HTML = r"""<!doctype html>
               <thead>
                 <tr>
                   <th>Client</th>
-                  <th>RustDesk ID</th>
                   <th>Status</th>
                   <th>Presence</th>
-                  <th>Last IP</th>
                   <th>Last seen</th>
                   <th>Credential</th>
                   <th>Actions</th>
                   <th title="Lifetime messages sent / lifetime established connections">MSG/Conn</th>
                   <th>Connected To</th>
+                  <th title="Managed build number, from the device's most recent debug-log upload">Build #</th>
+                  <th title="Whether the client's own background update checker has detected a newer build">Update</th>
                 </tr>
               </thead>
               <tbody id="deviceRows"></tbody>
@@ -2712,8 +2752,7 @@ ADMIN_HTML = r"""<!doctype html>
 
         <section id="ownerPermissionsSection" class="owner-only">
 
-          <div class="ops-primary-grid">
-          <section class="panel compact-panel" id="operationsPanel">
+          <section class="panel" id="operationsPanel">
             <div class="panel-head">
               <div>
                 <h2>Server Health</h2>
@@ -2741,6 +2780,31 @@ ADMIN_HTML = r"""<!doctype html>
                 <div class="ops-status-row"><span class="ops-status-label">Directory HTTPS TLS</span><span id="opsTls" class="ops-status-value">-</span></div>
                 <div class="ops-status-row"><span class="ops-status-label">Client API HTTPS</span><span id="opsClientTls" class="ops-status-value">-</span></div>
                 <div class="ops-status-row"><span class="ops-status-label">Disk Free</span><span id="opsDisk" class="ops-status-value">-</span></div>
+              </section>
+              <section class="ops-status-group">
+                <h3>Proxmox Host</h3>
+                <div class="ops-status-row"><span class="ops-status-label">CPU Load</span><span id="opsHostLoad" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label">Memory</span><span id="opsHostMemory" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label">Root FS</span><span id="opsHostRootFs" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label">Uptime / Version</span><span id="opsHostUptime" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label">OS Updates</span><span id="opsHostUpdates" class="ops-status-value">-</span></div>
+              </section>
+              <section class="ops-status-group">
+                <h3>Storage</h3>
+                <div class="ops-status-row"><span class="ops-status-label">ZFS Pool</span><span id="opsZfsPool" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label">SSD Wear</span><span id="opsSsdWear" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label">Spinner Health</span><span id="opsSpinnerHealth" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label">RAID Controller</span><span id="opsRaidController" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label">Physical Drives (Controller)</span><span id="opsRaidDrives" class="ops-status-value">-</span></div>
+              </section>
+              <section class="ops-status-group">
+                <h3>Hardware Sensors</h3>
+                <div class="ops-status-row"><span class="ops-status-label">CPU Temps</span><span id="opsCpuTemps" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label">Fans</span><span id="opsBmcFans" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label">Power Supplies</span><span id="opsBmcPsu" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label">BMC Event Log</span><span id="opsBmcSel" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label" title="Shared homelab UPS on the UGreen NAS - monitored for visibility only, does not drive this host's shutdown">NUT / UPS Status (NAS)</span><span id="opsNutStatus" class="ops-status-value">-</span></div>
+                <div class="ops-status-row"><span class="ops-status-label" title="This host's own dedicated UPS, connected directly to its rear USB port - drives this host's actual shutdown decisions">NUT / UPS Status (DL380)</span><span id="opsNutStatusDl380" class="ops-status-value">-</span></div>
               </section>
             </section>
             <div class="warning-box" id="opsDetail">
@@ -2777,7 +2841,6 @@ ADMIN_HTML = r"""<!doctype html>
               Waiting for upstream assessment.
             </div>
           </section>
-          </div>
 
         </section>
 
@@ -2851,59 +2914,6 @@ ADMIN_HTML = r"""<!doctype html>
           </div>
         </section>
 
-        <section class="panel dashboard-panel">
-          <div class="panel-head">
-            <div>
-              <h2>Fleet Overview</h2>
-              <p>Client status distribution, recent connection activity, and a 7-day trend.</p>
-            </div>
-          </div>
-
-          <div class="dash-grid">
-            <div class="dash-card">
-              <h3>Client Status</h3>
-              <div id="distributionRows"></div>
-            </div>
-
-            <div class="dash-card">
-              <h3>Connections (last 24h)</h3>
-              <div class="dash-stat-grid">
-                <div class="dash-stat">
-                  <div id="conn24Established" class="dash-stat-value good">0</div>
-                  <div class="dash-stat-label">Established</div>
-                </div>
-              </div>
-            </div>
-
-            <div class="dash-card">
-              <h3>Established Connections</h3>
-              <div class="dash-stat-grid">
-                <div class="dash-stat">
-                  <div id="connections7d" class="dash-stat-value good">0</div>
-                  <div class="dash-stat-label">Last 7 days</div>
-                </div>
-                <div class="dash-stat">
-                  <div id="connectionsLifetime" class="dash-stat-value good">0</div>
-                  <div class="dash-stat-label">Lifetime</div>
-                </div>
-              </div>
-            </div>
-
-            <div class="dash-card">
-              <h3>Messages Sent</h3>
-              <div class="dash-stat-grid">
-                <div class="dash-stat">
-                  <div id="messages7d" class="dash-stat-value good">0</div>
-                  <div class="dash-stat-label">Last 7 days</div>
-                </div>
-                <div class="dash-stat">
-                  <div id="messagesLifetime" class="dash-stat-value good">0</div>
-                  <div class="dash-stat-label">Lifetime</div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
       </section>
 
       <section id="securityTab" class="tab-view hidden owner-only">
@@ -3372,7 +3382,6 @@ ADMIN_HTML = r"""<!doctype html>
     const blockedRevokedEmpty = document.getElementById(
       "blockedRevokedEmpty"
     );
-    const distributionRows = document.getElementById("distributionRows");
     const operatorRows = document.getElementById("operatorRows");
     const operatorModal = document.getElementById("operatorModal");
     const operatorDetailGrid = document.getElementById("operatorDetailGrid");
@@ -3838,6 +3847,85 @@ ADMIN_HTML = r"""<!doctype html>
       }).join("");
     }
 
+    function formatBytesGB(bytes) {
+      if (bytes === null || bytes === undefined) return null;
+      return `${(Number(bytes) / 1024 / 1024 / 1024).toFixed(1)}GB`;
+    }
+
+    function formatUptime(seconds) {
+      if (seconds === null || seconds === undefined) return null;
+      const days = Math.floor(Number(seconds) / 86400);
+      const hours = Math.floor((Number(seconds) % 86400) / 3600);
+      if (days > 0) return `${days}d ${hours}h`;
+      const minutes = Math.floor((Number(seconds) % 3600) / 60);
+      return `${hours}h ${minutes}m`;
+    }
+
+    function deviceSpecsHtml(device) {
+      if (!device.debug_log_uploaded_at) {
+        return `
+          <div class="detail-item" style="grid-column: 1 / -1">
+            <div class="detail-label">Device specs</div>
+            <div class="detail-value">No debug log uploaded yet from this client.</div>
+          </div>
+        `;
+      }
+
+      const manufacturerModel = [device.debug_log_manufacturer, device.debug_log_model]
+        .filter(Boolean)
+        .join(" ");
+      const diskFree = formatBytesGB(device.debug_log_system_drive_available_bytes);
+      const diskTotal = formatBytesGB(device.debug_log_system_drive_total_bytes);
+      const disk = diskFree && diskTotal ? `${diskFree} free / ${diskTotal} total` : "-";
+
+      const specs = [
+        ["Operating system", device.debug_log_os || "-"],
+        ["CPU", device.debug_log_cpu || "-"],
+        ["Memory", device.debug_log_memory || "-"],
+        ["Manufacturer / model", manufacturerModel || "-"],
+        ["Architecture", device.debug_log_architecture || "-"],
+        ["System drive", disk],
+        ["Uptime", formatUptime(device.debug_log_uptime_seconds) || "-"],
+        ["Managed build #", device.debug_log_build_number ?? "-"],
+        ["Update status", null],
+        ["Specs as of", formatDate(device.debug_log_uploaded_at)],
+      ];
+
+      return specs.map(([label, value]) => `
+        <div class="detail-item">
+          <div class="detail-label">${escapeHtml(label)}</div>
+          <div class="detail-value">${
+            value === null
+              ? buildUpdateStatusHtml(device)
+              : escapeHtml(value)
+          }</div>
+        </div>
+      `).join("");
+    }
+
+    function buildUpdateStatusHtml(device) {
+      if (!device.debug_log_uploaded_at) {
+        return `<span class="sub">No log yet</span>`;
+      }
+      // debug_log_update_status is the server comparing this device's
+      // last-known build against the currently published manifest, so it
+      // stays correct even when the debug log itself predates the newest
+      // publish. debug_log_pending_update is the client's own self-report
+      // from that same upload - kept as a second signal since either source
+      // saying "update available" should win over the other saying nothing.
+      if (device.debug_log_pending_update) {
+        const pending = device.debug_log_pending_update;
+        return `<span class="badge pending" title="Client's own background update checker detected this">Update available (build ${escapeHtml(pending.build_number ?? "?")})</span>`;
+      }
+      if (device.debug_log_update_status === "update_available") {
+        return `<span class="badge pending" title="Last-known build is behind the currently published release">Update available (build ${escapeHtml(device.debug_log_latest_known_build ?? "?")})</span>`;
+      }
+      if (device.debug_log_update_status === "unknown") {
+        return `<span class="sub">Unknown</span>`;
+      }
+      return `<span class="badge approved">Up to date</span>`;
+    }
+
     function renderDevices() {
       const selected = statusFilter.value;
       const managed = deviceItems.filter(
@@ -3876,17 +3964,17 @@ ADMIN_HTML = r"""<!doctype html>
           device.status || "unknown"
         );
 
+        const nameHtml =
+          device.rustdesk_id && device.status === "approved"
+            ? `<a class="rustdesk-link" href="rustdesk://${escapeHtml(device.rustdesk_id)}" title="Open a direct session with this client">${escapeHtml(name)} <span class="connect-hint">&#8599; Connect</span></a>`
+            : escapeHtml(name);
+
         return `
           <tr>
             <td>
-              <div class="name">${escapeHtml(name)}</div>
+              <div class="name">${nameHtml}</div>
               <div class="sub">${escapeHtml(host)}</div>
             </td>
-            <td>${
-              device.rustdesk_id && device.status === "approved"
-                ? `<a class="rustdesk-link" href="rustdesk://${escapeHtml(device.rustdesk_id)}" title="Open a direct session with this client">${escapeHtml(device.rustdesk_id)} <span class="connect-hint">&#8599; Connect</span></a>`
-                : escapeHtml(device.rustdesk_id || "-")
-            }</td>
             <td>
               <span class="badge ${statusName}">
                 ${statusName}
@@ -3901,7 +3989,6 @@ ADMIN_HTML = r"""<!doctype html>
                 ${recent ? "Active" : "Inactive"}
               </span>
             </td>
-            <td>${escapeHtml(device.last_ip || "-")}</td>
             <td>${escapeHtml(formatDate(device.last_seen_at))}</td>
             <td>
               <span class="badge ${
@@ -3927,6 +4014,8 @@ ADMIN_HTML = r"""<!doctype html>
               Number(device.lifetime_connections || 0)
             }</td>
             <td>${connectedToHtml(device)}</td>
+            <td>${escapeHtml(device.debug_log_build_number ?? "-")}</td>
+            <td>${buildUpdateStatusHtml(device)}</td>
           </tr>`;
       }).join("");
     }
@@ -3963,34 +4052,7 @@ ADMIN_HTML = r"""<!doctype html>
 
 
 
-    function renderDistribution(counts) {
-      const order = [
-        ["approved", "Approved"],
-        ["pending", "Pending"],
-        ["blocked", "Blocked"],
-        ["revoked", "Revoked"],
-        ["denied", "Denied"]
-      ];
-      const total = order.reduce(
-        (sum, [key]) => sum + Number(counts[key] || 0),
-        0
-      ) || 1;
-
-      distributionRows.innerHTML = order.map(([key, label]) => {
-        const count = Number(counts[key] || 0);
-        const pct = Math.round((count / total) * 100);
-        return `
-          <div class="dist-row">
-            <span class="dist-label">${label}</span>
-            <div class="dist-bar"><div class="dist-fill ${key}" style="width:${pct}%"></div></div>
-            <span class="dist-count">${count}</span>
-          </div>`;
-      }).join("");
-    }
-
     function renderDashboardSummary(data) {
-      renderDistribution(data.device_status_counts || {});
-
       const conn = data.connection_stats_24h || {};
       document.getElementById("conn24Established").textContent = conn.established || 0;
 
@@ -4045,6 +4107,13 @@ ADMIN_HTML = r"""<!doctype html>
             data-id="${id}" data-name="${name}"
             data-action="block" type="button">Block client</button>`
         );
+        if (isBrad()) {
+          buttons.push(
+            `<button class="small secondary device-request-log"
+              data-id="${id}" data-name="${name}"
+              type="button">Request log</button>`
+          );
+        }
       } else if (device.status === "denied") {
         buttons.push(`<span class="badge denied">denied</span>`);
         if (isOwner()) {
@@ -4091,9 +4160,6 @@ ADMIN_HTML = r"""<!doctype html>
         ["Hostname", device.hostname || "-"],
         ["Friendly name", device.friendly_name || "-"],
         ["Email address", device.contact_email || "-"],
-        ["Status", device.status || "unknown"],
-        ["Status reason", device.status_reason || "-"],
-        ["Last IP", device.last_ip || "-"],
         ["Last seen", formatDate(device.last_seen_at)],
         ["Created", formatDate(device.created_at)],
         [
@@ -4112,7 +4178,7 @@ ADMIN_HTML = r"""<!doctype html>
           <div class="detail-label">${escapeHtml(label)}</div>
           <div class="detail-value">${escapeHtml(value)}</div>
         </div>
-      `).join("");
+      `).join("") + deviceSpecsHtml(device);
 
       deviceModalActions.innerHTML = modalActionButtons(device);
 
@@ -4268,6 +4334,45 @@ ADMIN_HTML = r"""<!doctype html>
         `${deviceName}: ${action} completed successfully.`
       );
       await loadDashboard();
+    }
+
+    async function requestDeviceLog(deviceId, deviceName) {
+      const response = await request(
+        `/devices/${encodeURIComponent(deviceId)}/logs/request`,
+        { method: "POST" }
+      );
+
+      if (!response.ok) {
+        showToast(await parseError(response), true);
+        return;
+      }
+
+      showToast(
+        `${deviceName}: a fresh debug log has been requested. It will upload on the device's next check-in.`
+      );
+    }
+
+    async function requestAllDeviceLogs() {
+      if (!window.confirm(
+        "Request a fresh debug log from every approved client? Each will upload on its next check-in instead of waiting on its normal 24-hour cadence."
+      )) {
+        return;
+      }
+
+      const response = await request(
+        "/device-logs/request-all",
+        { method: "POST" }
+      );
+
+      if (!response.ok) {
+        showToast(await parseError(response), true);
+        return;
+      }
+
+      const result = await response.json();
+      showToast(
+        `Requested a fresh debug log from ${result.device_count} approved client(s).`
+      );
     }
 
     function isProtectedBradAccount(account) {
@@ -4748,6 +4853,42 @@ ADMIN_HTML = r"""<!doctype html>
       return `${Math.round(value / 86400)} days`;
     }
 
+    // All temperature data from the prox watcher (smartctl/ssacli/ipmitool)
+    // is collected and alert-thresholded in Celsius, matching what those
+    // tools report natively - this only converts for display.
+    function toFahrenheit(celsius) {
+      const value = Number(celsius);
+      return Number.isFinite(value) ? Math.round(value * 9 / 5 + 32) : null;
+    }
+
+    // Mirrors --good/--warn/--bad from :root - a real RGB interpolation
+    // needs actual values, not var() references, so these are kept in
+    // sync by hand. Smooth 3-stop gradient (green -> amber -> red) across
+    // the 0-50% SSD wear range, since 50% is the dedicated wear-alert
+    // threshold - anything past that just stays fully red.
+    const WEAR_COLOR_STOPS = [
+      { at: 0, rgb: [55, 201, 120] },   // --good
+      { at: 25, rgb: [246, 185, 75] },  // --warn
+      { at: 50, rgb: [240, 99, 104] },  // --bad
+    ];
+
+    function wearColor(percent) {
+      const clamped = Math.max(0, Math.min(50, Number(percent) || 0));
+      let lower = WEAR_COLOR_STOPS[0];
+      let upper = WEAR_COLOR_STOPS[WEAR_COLOR_STOPS.length - 1];
+      for (let i = 0; i < WEAR_COLOR_STOPS.length - 1; i++) {
+        if (clamped >= WEAR_COLOR_STOPS[i].at && clamped <= WEAR_COLOR_STOPS[i + 1].at) {
+          lower = WEAR_COLOR_STOPS[i];
+          upper = WEAR_COLOR_STOPS[i + 1];
+          break;
+        }
+      }
+      const span = upper.at - lower.at || 1;
+      const t = (clamped - lower.at) / span;
+      const rgb = lower.rgb.map((channel, i) => Math.round(channel + (upper.rgb[i] - channel) * t));
+      return `rgb(${rgb.join(", ")})`;
+    }
+
     function renderOperations() {
       const state = operationsState || {};
       const services = state.services || {};
@@ -4795,9 +4936,171 @@ ADMIN_HTML = r"""<!doctype html>
       document.getElementById("opsRustDesk").textContent =
         rustdesk.hbbs_version || "Unknown";
 
+      // Proxmox host metrics (SSD wear, ZFS pool, spinner SMART health, host
+      // vitals) - pushed by a watcher script running on prox itself, see
+      // main.py's internal_host_metrics. null/stale means the watcher
+      // hasn't reported (yet, or has stopped) rather than a real problem,
+      // so those states render as "Unknown" rather than as a failure.
+      const hostMetrics = state.host_metrics;
+      const hostStale = !hostMetrics || hostMetrics.stale;
+      const drives = (hostMetrics && hostMetrics.drives) || [];
+      const zfsPools = (hostMetrics && hostMetrics.zfs_pools) || [];
+      const host = (hostMetrics && hostMetrics.host) || {};
+
+      const ssdDrives = drives.filter(d => d.kind === "ssd");
+      const spinnerDrives = drives.filter(d => d.kind !== "ssd");
+      const WEAR_ALERT_PERCENT = 50;
+      const WEAR_CRITICAL_PERCENT = 90;
+      const maxWear = ssdDrives.reduce((max, d) => {
+        const value = Number(d.wear_used_percent);
+        return Number.isFinite(value) ? Math.max(max, value) : max;
+      }, 0);
+      const anySmartFail = drives.some(d => d.smart_passed === false);
+      const zfsAllOnline = zfsPools.length > 0 && zfsPools.every(
+        p => p.health === "ONLINE"
+          && !p.read_errors && !p.write_errors && !p.checksum_errors
+      );
+
+      document.getElementById("opsZfsPool").textContent = hostStale
+        ? "Unknown"
+        : zfsPools.length
+          ? zfsPools.map(p => {
+              const errors = (p.read_errors || 0) + (p.write_errors || 0) + (p.checksum_errors || 0);
+              return `${p.name}: ${p.health}${errors ? ` (${errors} error${errors === 1 ? "" : "s"})` : ""}`;
+            }).join(", ")
+          : "No pools reported";
+
+      document.getElementById("opsSsdWear").innerHTML = hostStale
+        ? "Unknown"
+        : ssdDrives.length
+          ? ssdDrives.map(d => {
+              const percent = Number(d.wear_used_percent);
+              const label = Number.isFinite(percent) ? `${percent}%` : "?%";
+              const color = Number.isFinite(percent) ? wearColor(percent) : "var(--muted)";
+              return `${escapeHtml(d.device)}-<span style="color: ${color}">${label}</span>`;
+            }).join(", ")
+          : "No SSDs reported";
+
+      document.getElementById("opsSpinnerHealth").textContent = hostStale
+        ? "Unknown"
+        : spinnerDrives.length
+          ? spinnerDrives.map(d => {
+              const bad = d.smart_passed === false || d.reallocated_sectors || d.pending_sectors;
+              return `${d.device}: ${d.smart_passed === false ? "FAILED" : "PASSED"}${bad && d.smart_passed !== false ? ` (${d.reallocated_sectors || 0} realloc, ${d.pending_sectors || 0} pending)` : ""}`;
+            }).join(", ")
+          : "None";
+
+      const loadAvg = Array.isArray(host.load_average) ? host.load_average : null;
+      document.getElementById("opsHostLoad").textContent = hostStale || !loadAvg
+        ? "Unknown"
+        : `${loadAvg.map(v => Number(v).toFixed(2)).join(", ")} (${host.cpu_count || "?"} threads)`;
+
+      const memUsed = Number(host.memory_used_bytes);
+      const memTotal = Number(host.memory_total_bytes);
+      document.getElementById("opsHostMemory").textContent = hostStale
+        || !Number.isFinite(memUsed) || !Number.isFinite(memTotal) || !memTotal
+        ? "Unknown"
+        : `${(memUsed / 1e9).toFixed(1)}GB / ${(memTotal / 1e9).toFixed(1)}GB (${((memUsed / memTotal) * 100).toFixed(0)}%)`;
+
+      const rootUsed = Number(host.root_fs_used_bytes);
+      const rootTotal = Number(host.root_fs_total_bytes);
+      document.getElementById("opsHostRootFs").textContent = hostStale
+        || !Number.isFinite(rootUsed) || !Number.isFinite(rootTotal) || !rootTotal
+        ? "Unknown"
+        : `${(rootUsed / 1e9).toFixed(1)}GB / ${(rootTotal / 1e9).toFixed(1)}GB (${((rootUsed / rootTotal) * 100).toFixed(1)}%)`;
+
+      const uptimeSeconds = Number(host.uptime_seconds);
+      document.getElementById("opsHostUptime").textContent = hostStale
+        ? "Unknown"
+        : `${Number.isFinite(uptimeSeconds) ? ageText(uptimeSeconds) : "?"} - ${host.pve_version || "unknown PVE"}, kernel ${host.kernel_version || "unknown"}`;
+
+      const pendingUpdates = Number(host.pending_updates);
+      document.getElementById("opsHostUpdates").textContent = hostStale
+        ? "Unknown"
+        : `${Number.isFinite(pendingUpdates) ? pendingUpdates : "?"} pending${host.reboot_required ? " - REBOOT REQUIRED" : ""}`;
+
+      // RAID controller(s), BMC environmental sensors, and the BMC's own
+      // persistent event log (SEL) - all from the HPE-specific tooling
+      // (ssacli/ipmitool) the prox watcher script runs, independent of
+      // what the OS itself can see (e.g. controller-level drive status is
+      // a genuinely separate signal from SMART, not just a duplicate).
+      const raidControllers = (hostMetrics && hostMetrics.raid_controllers) || [];
+      const bmc = (hostMetrics && hostMetrics.bmc) || {};
+      const sel = (hostMetrics && hostMetrics.sel) || {};
+
+      const anyControllerBad = raidControllers.some(c => c.status !== "OK");
+      const anyControllerDrivesBad = raidControllers.some(
+        c => c.physical_drives_ok !== c.physical_drives_reported
+      );
+
+      document.getElementById("opsRaidController").textContent = hostStale
+        ? "Unknown"
+        : raidControllers.length
+          ? raidControllers.map(c => `${c.model} - ${c.status}${toFahrenheit(c.temperature_c) !== null ? `, ${toFahrenheit(c.temperature_c)}°F` : ""}`).join("; ")
+          : "None reported";
+
+      document.getElementById("opsRaidDrives").textContent = hostStale
+        ? "Unknown"
+        : raidControllers.length
+          ? raidControllers.map(c => {
+              const bad = c.physical_drives_not_ok || [];
+              return `${c.physical_drives_ok}/${c.physical_drives_reported} OK` + (bad.length ? ` (not OK: ${bad.join(", ")})` : "");
+            }).join("; ")
+          : "None reported";
+
+      document.getElementById("opsCpuTemps").textContent = hostStale
+        ? "Unknown"
+        : (bmc.cpu_temps_c && bmc.cpu_temps_c.length)
+          ? bmc.cpu_temps_c.map((c, i) => `CPU${i + 1} ${toFahrenheit(c.temperature_c)}°F`).join(", ")
+          : "Unknown";
+
+      const fansOk = bmc.fans_status === "Fully Redundant";
+      document.getElementById("opsBmcFans").textContent = hostStale
+        ? "Unknown"
+        : (bmc.fans_status || "Unknown");
+
+      const psuOk = bmc.power_supplies_status === "Fully Redundant";
+      document.getElementById("opsBmcPsu").textContent = hostStale
+        ? "Unknown"
+        : bmc.power_supplies_status
+          ? (psuOk ? "OK" : `NOT OK (${bmc.power_supplies_status})`)
+          : "Unknown";
+
+      const nutByCondition = (hostMetrics && hostMetrics.nut) || {};
+      const nutNas = nutByCondition.nut_status || {};
+      const nutDl380 = nutByCondition.nut_status_dl380 || {};
+      const nutNasOk = Boolean(nutNas.ok);
+      const nutDl380Ok = Boolean(nutDl380.ok);
+      const renderNutRow = (elementId, entry, ok) => {
+        document.getElementById(elementId).textContent = hostStale
+          ? "Unknown"
+          : entry.reachable === undefined
+            ? "Unknown"
+            : (ok ? "OK" : `NOT OK (${entry.detail || "unreachable"})`);
+      };
+      renderNutRow("opsNutStatus", nutNas, nutNasOk);
+      renderNutRow("opsNutStatusDl380", nutDl380, nutDl380Ok);
+
+      const selCapacityBad = Number.isFinite(Number(sel.percent_used)) && Number(sel.percent_used) >= 90;
+      document.getElementById("opsBmcSel").textContent = hostStale
+        ? "Unknown"
+        : Number.isFinite(Number(sel.percent_used))
+          ? `${sel.total_entries} entries, ${sel.percent_used}% full${selCapacityBad ? " - clear with ipmitool sel clear" : ""}`
+          : "Unknown";
+
+      const hostOk = hostStale || (
+        !anySmartFail && zfsAllOnline && maxWear < WEAR_CRITICAL_PERCENT
+        && !anyControllerBad && !anyControllerDrivesBad
+        && (bmc.fans_status == null || fansOk) && (bmc.power_supplies_status == null || psuOk)
+        && !selCapacityBad
+        && (nutNas.reachable === undefined || nutNasOk)
+        && (nutDl380.reachable === undefined || nutDl380Ok)
+      );
+
       const overallOk = (
         apiOk && dbOk && relayEnforced && backupOk
         && restoreOk && tlsOk && clientTlsOk && diskOk && pinned
+        && hostOk
       );
       const badge = document.getElementById("opsOverallBadge");
       badge.textContent = overallOk ? "HEALTHY" : "ATTENTION";
@@ -4808,6 +5111,41 @@ ADMIN_HTML = r"""<!doctype html>
         `Status generated: ${formatDate(state.generated_at)}`
       );
       details.push(`Relay Guard: ${relayEnforced ? "ENFORCED" : relayStaged ? "STAGED — enforcement not yet enabled" : (services.relay_guard || "Unknown")}`);
+      if (hostStale) {
+        details.push("Proxmox host watcher has not reported recently — drive/host metrics are unknown.");
+      } else {
+        if (maxWear >= WEAR_ALERT_PERCENT) {
+          details.push(`SSD wear warning: at least one drive is at ${maxWear}% used (alert threshold ${WEAR_ALERT_PERCENT}%).`);
+        }
+        if (anySmartFail) {
+          const failed = drives.filter(d => d.smart_passed === false).map(d => d.device).join(", ");
+          details.push(`SMART self-assessment FAILED on: ${failed}.`);
+        }
+        if (!zfsAllOnline) {
+          details.push("ZFS pool is not fully ONLINE or is reporting errors — check zpool status.");
+        }
+        if (anyControllerBad) {
+          details.push("RAID controller status is not OK — check ssacli ctrl all show status.");
+        }
+        if (anyControllerDrivesBad) {
+          details.push("RAID controller reports at least one physical drive not OK.");
+        }
+        if (bmc.fans_status && !fansOk) {
+          details.push(`Fan redundancy degraded: ${bmc.fans_status}.`);
+        }
+        if (bmc.power_supplies_status && !psuOk) {
+          details.push(`Power supply redundancy degraded: ${bmc.power_supplies_status}.`);
+        }
+        if (selCapacityBad) {
+          details.push(`BMC event log is ${sel.percent_used}% full — clear it with 'ipmitool sel clear' so new events can still be recorded.`);
+        }
+        if (!nutNasOk && nutNas.reachable !== undefined) {
+          details.push(`NUT/UPS status (NAS): NOT OK (${nutNas.detail || "unreachable"}).`);
+        }
+        if (!nutDl380Ok && nutDl380.reachable !== undefined) {
+          details.push(`NUT/UPS status (DL380): NOT OK (${nutDl380.detail || "unreachable"}).`);
+        }
+      }
       if (backup.path) {
         details.push(
           `Latest daily backup: ${backup.path} (${ageText(backup.age_seconds)} old)`
@@ -5919,6 +6257,12 @@ ADMIN_HTML = r"""<!doctype html>
     });
 
     document.getElementById(
+      "requestAllLogsButton"
+    ).addEventListener("click", () => {
+      void requestAllDeviceLogs();
+    });
+
+    document.getElementById(
       "exportClientsButton"
     ).addEventListener("click", () => {
       const selected = statusFilter.value;
@@ -6019,6 +6363,15 @@ ADMIN_HTML = r"""<!doctype html>
         openReenrollmentModal(
           reenrollButton.dataset.id,
           reenrollButton.dataset.name
+        );
+        return;
+      }
+
+      const requestLogButton = event.target.closest(".device-request-log");
+      if (requestLogButton) {
+        void requestDeviceLog(
+          requestLogButton.dataset.id,
+          requestLogButton.dataset.name
         );
         return;
       }
