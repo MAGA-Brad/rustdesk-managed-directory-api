@@ -30,6 +30,7 @@ RESET_MINUTES = 30
 RELAY_LEASE_SECONDS = 600
 RELAY_RENEW_AFTER_SECONDS = 240
 REENROLLMENT_AUTH_MINUTES = 30
+
 # Public rendezvous server (hbbs) address handed to clients in relay-lease
 # responses, host:port. Set this to your own hbbs deployment.
 RUSTDESK_SERVER_ADDRESS = os.getenv("RUSTDESK_SERVER_ADDRESS", "rendezvous.example.com:21116")

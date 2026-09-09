@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+websockets
 psycopg[binary,pool]
 pydantic-settings
 pyotp

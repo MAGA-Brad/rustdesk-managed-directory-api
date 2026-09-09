@@ -6,8 +6,11 @@ import json
 import os
 import re
 import secrets
+import smtplib
+import ssl
 import uuid
 from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +32,34 @@ TOKEN_SECRET = os.environ["TOKEN_SIGNING_SECRET"]
 DEVICE_SECRET = os.environ["DEVICE_CREDENTIAL_SECRET"]
 TOTP_KEY = os.environ["TOTP_ENCRYPTION_SECRET"]
 
+# Mobile companion app (client-manager Android app) config. All optional at
+# startup - the mobile-app routes still work without them (push just no-ops)
+# so the container doesn't crash-loop before this is fully provisioned.
+HEALTH_WATCHER_SHARED_SECRET = os.environ.get("HEALTH_WATCHER_SHARED_SECRET") or None
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID") or None
+_firebase_service_account_file = os.environ.get("FIREBASE_SERVICE_ACCOUNT_FILE") or None
+FIREBASE_SERVICE_ACCOUNT: dict[str, Any] | None = None
+if _firebase_service_account_file:
+    try:
+        FIREBASE_SERVICE_ACCOUNT = json.loads(
+            Path(_firebase_service_account_file).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        FIREBASE_SERVICE_ACCOUNT = None
+
+# Outbound mail (first step toward Mailcow integration). Optional at startup
+# for the same crash-loop-avoidance reason as the mobile-app secrets above -
+# the smtp-config endpoints simply refuse to work (503) until this is set.
+SMTP_ENCRYPTION_SECRET = os.environ.get("SMTP_ENCRYPTION_SECRET") or None
+
 ACCESS_TOKEN_MINUTES = 15
 SESSION_DAYS = 30
+# Brad's explicit ask: the mobile companion app should never force a
+# re-login. A very long, rolling window (extended again on every refresh
+# below) achieves that in practice without literally never expiring - the
+# access token itself still only lives 15 minutes either way, re-issued
+# transparently by the app's own automatic-refresh-on-401 logic.
+MOBILE_SESSION_DAYS = 3650
 MAX_LOGIN_FAILURES = 5
 LOCKOUT_MINUTES = 15
 ENROLLMENT_POLL_DAYS = 90
@@ -39,6 +68,19 @@ PRESENCE_TIMEOUT_SECONDS = 45
 UPDATE_ROOT = Path("/srv/rustdesk-updates")
 UPDATE_RELEASES = UPDATE_ROOT / "releases"
 UPDATE_MANIFESTS = UPDATE_ROOT / "manifests"
+
+
+def _notify_device_pending(device: dict[str, Any]) -> None:
+    # Set by register_mobile_routes() near the bottom of this module, once
+    # it's imported - always populated by the time any request is served.
+    # Best-effort only: this must never affect the enrollment response.
+    notify = getattr(app.state, "notify_pending_device", None)
+    if notify is None:
+        return
+    try:
+        notify(device)
+    except Exception:
+        pass
 
 def safe_update_file(base: Path, name: str) -> Path:
     target = (base / name).resolve()
@@ -158,6 +200,7 @@ def issue_access_token(
     session_id: uuid.UUID,
     role: str,
     now: datetime,
+    scope: str = "full",
 ) -> tuple[str, datetime]:
     expires_at = now + timedelta(minutes=ACCESS_TOKEN_MINUTES)
 
@@ -166,6 +209,7 @@ def issue_access_token(
             "sub": str(account_id),
             "sid": str(session_id),
             "role": role,
+            "scope": scope,
             "type": "access",
             "iat": now,
             "exp": expires_at,
@@ -231,6 +275,7 @@ def require_operator(
                     os.account_id,
                     os.mfa_verified_at,
                     os.expires_at AS session_expires_at,
+                    os.scope,
                     oa.username,
                     oa.display_name,
                     oa.role,
@@ -466,12 +511,17 @@ def write_enrollment_event(
     )
 
 
-def require_owner(
-    operator: dict[str, Any] = Depends(require_operator),
-) -> dict[str, Any]:
+def _enforce_owner(operator: dict[str, Any]) -> dict[str, Any]:
+    # Every current owner-gated route (enrollment secrets, device
+    # contact-email edits, operator-account/invitation/role-change
+    # management) is out of scope for the mobile companion app by design -
+    # baking the scope check in here means any future owner-only route is
+    # automatically covered too, without relying on remembering to annotate
+    # each one individually.
     if (
         operator["role"] != "owner"
         or operator["must_change_password"]
+        or operator["scope"] != "full"
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -479,6 +529,69 @@ def require_owner(
         )
 
     return operator
+
+
+def _enforce_brad_only(operator: dict[str, Any]) -> dict[str, Any]:
+    # Multiple accounts hold the "owner" role (brad, michael, bradpixel,
+    # brady), but mail-server credentials are the first piece of the Mailcow
+    # integration path and are scoped to Brad's own protected account
+    # specifically - reuses the same identity check that already guards his
+    # account's lifecycle/role protections, rather than a parallel one.
+    if not is_protected_brad_account(operator):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action is restricted to Brad's account",
+        )
+
+    return operator
+
+
+def require_owner(
+    operator: dict[str, Any] = Depends(require_operator),
+) -> dict[str, Any]:
+    return _enforce_owner(operator)
+
+
+def require_brad_only(
+    operator: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    return _enforce_brad_only(operator)
+
+
+# The admin dashboard authenticates via an HttpOnly cookie (see
+# admin_ui.py's require_admin_operator, which reads ACCESS_COOKIE and calls
+# require_operator directly rather than through FastAPI's header-based
+# Depends chain) - browser fetch() calls never set an Authorization header.
+# Routes registered directly in main.py (rather than through
+# register_admin_routes) need this same cookie-based extraction, or every
+# dashboard-originated call 401s with "Invalid or expired authentication"
+# despite a fully valid session - exactly what happened when this was first
+# missed for the smtp-config and dashboard-summary routes below.
+ADMIN_ACCESS_COOKIE = "__Secure-rd-admin-access"
+
+
+def require_admin_cookie_operator(request: Request) -> dict[str, Any]:
+    access_token = request.cookies.get(ADMIN_ACCESS_COOKIE)
+    if not access_token:
+        raise unauthorized()
+
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer",
+        credentials=access_token,
+    )
+    return require_operator(credentials)
+
+
+def require_admin_cookie_owner(
+    operator: dict[str, Any] = Depends(require_admin_cookie_operator),
+) -> dict[str, Any]:
+    return _enforce_owner(operator)
+
+
+def require_admin_cookie_brad_only(
+    operator: dict[str, Any] = Depends(require_admin_cookie_owner),
+) -> dict[str, Any]:
+    return _enforce_brad_only(operator)
 
 
 def require_device_manager(
@@ -491,6 +604,25 @@ def require_device_manager(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Owner or Manager authorization is required",
+        )
+
+    return operator
+
+
+def require_full_scope_operator(
+    operator: dict[str, Any] = Depends(require_operator),
+) -> dict[str, Any]:
+    # Operator-account management (invitations, role changes, disable/enable/
+    # delete/unlock, session revocation) must never be reachable by a token
+    # issued to the mobile companion app, regardless of the account's role -
+    # this is a structural guarantee against a lost/compromised phone, not
+    # just something the app's own UI chooses not to expose. Checked against
+    # the session row (re-derived every request, same as role above), not the
+    # JWT claim alone.
+    if operator["scope"] != "full":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action is not available to this session",
         )
 
     return operator
@@ -534,8 +666,16 @@ def require_device(
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise unauthorized()
 
-    credential = credentials.credentials
+    return validate_device_credential(credentials.credentials)
 
+
+def validate_device_credential(credential: str) -> dict[str, Any]:
+    # Core of require_device(), factored out so callers that can't use a
+    # plain FastAPI Depends() - the chat websocket route, specifically,
+    # where an HTTPException raised from a dependency doesn't close the
+    # socket as predictably as it rejects a normal HTTP request - can run
+    # the same JWT + DB validation manually and control the accept/close
+    # sequence themselves.
     try:
         claims = jwt.decode(
             credential,
@@ -777,8 +917,16 @@ def health():
     }
 
 
-@app.post("/v1/auth/login")
-def login(payload: LoginRequest, request: Request):
+def _perform_login(
+    payload,
+    request: Request,
+    scope: str = "full",
+) -> dict[str, Any]:
+    # scope is deliberately NOT a parameter of the @app.post route below - it
+    # must only ever be set by a trusted in-process caller (the mobile-login
+    # route in mobile_api.py passes scope="mobile"), never by anything an
+    # HTTP client could control, since a token's scope is what structurally
+    # keeps a mobile session away from operator-account-management routes.
     now = datetime.now(timezone.utc)
     source_ip = client_ip(request)
     username = payload.username.strip()
@@ -971,7 +1119,7 @@ def login(payload: LoginRequest, request: Request):
 
             session_id = uuid.uuid4()
             session_expires_at = now + timedelta(
-                days=SESSION_DAYS
+                days=MOBILE_SESSION_DAYS if scope == "mobile" else SESSION_DAYS
             )
 
             access_token, access_expires_at = issue_access_token(
@@ -979,6 +1127,7 @@ def login(payload: LoginRequest, request: Request):
                 session_id,
                 account["role"],
                 now,
+                scope=scope,
             )
 
             refresh_token = (
@@ -998,9 +1147,11 @@ def login(payload: LoginRequest, request: Request):
                     user_agent,
                     created_at,
                     expires_at,
-                    last_seen_at
+                    last_seen_at,
+                    scope
                 )
                 VALUES (
+                    %s,
                     %s,
                     %s,
                     %s,
@@ -1024,6 +1175,7 @@ def login(payload: LoginRequest, request: Request):
                     now,
                     session_expires_at,
                     now,
+                    scope,
                 ),
             )
 
@@ -1100,6 +1252,11 @@ def login(payload: LoginRequest, request: Request):
         connection.close()
 
 
+@app.post("/v1/auth/login")
+def login(payload: LoginRequest, request: Request):
+    return _perform_login(payload, request)
+
+
 @app.post("/v1/auth/refresh")
 def refresh(payload: RefreshRequest, request: Request):
     now = datetime.now(timezone.utc)
@@ -1113,6 +1270,7 @@ def refresh(payload: RefreshRequest, request: Request):
                     os.id AS session_id,
                     os.account_id,
                     os.expires_at AS session_expires_at,
+                    os.scope,
                     oa.username,
                     oa.display_name,
                     oa.role,
@@ -1137,16 +1295,28 @@ def refresh(payload: RefreshRequest, request: Request):
             if session is None:
                 raise unauthorized()
 
+            # Must carry the session's existing scope forward - refreshing a
+            # mobile session must never silently upgrade it to full scope.
             access_token, access_expires_at = issue_access_token(
                 session["account_id"],
                 session["session_id"],
                 session["role"],
                 now,
+                scope=session["scope"],
             )
 
             refresh_token = (
                 "rdr_"
                 + secrets.token_urlsafe(48)
+            )
+
+            # Rolling window for mobile sessions only (see MOBILE_SESSION_DAYS
+            # above) - a web/full-scope session's expires_at is untouched
+            # here, preserving its existing fixed-30-day-from-login behavior.
+            new_session_expires_at = (
+                now + timedelta(days=MOBILE_SESSION_DAYS)
+                if session["scope"] == "mobile"
+                else session["session_expires_at"]
             )
 
             cursor.execute(
@@ -1157,7 +1327,8 @@ def refresh(payload: RefreshRequest, request: Request):
                     refresh_token_hash = %s,
                     source_ip = %s,
                     user_agent = %s,
-                    last_seen_at = %s
+                    last_seen_at = %s,
+                    expires_at = %s
                 WHERE id = %s
                 """,
                 (
@@ -1166,6 +1337,7 @@ def refresh(payload: RefreshRequest, request: Request):
                     source_ip,
                     request.headers.get("user-agent"),
                     now,
+                    new_session_expires_at,
                     session["session_id"],
                 ),
             )
@@ -1206,9 +1378,7 @@ def refresh(payload: RefreshRequest, request: Request):
                 "refresh_token": refresh_token,
                 "token_type": "bearer",
                 "access_expires_at": access_expires_at,
-                "session_expires_at": session[
-                    "session_expires_at"
-                ],
+                "session_expires_at": new_session_expires_at,
                 "operator": {
                     "id": session["account_id"],
                     "username": session["username"],
@@ -2009,6 +2179,7 @@ def enroll_device(
                         },
                     )
                     connection.commit()
+                    _notify_device_pending(device)
                     return {
                         "result": "accepted_pending",
                         "device": device,
@@ -2143,6 +2314,16 @@ def enroll_device(
             )
 
             connection.commit()
+            _notify_device_pending(device)
+            _send_alert_email(
+                subject="New device enrolled",
+                body=(
+                    "A new device has enrolled and is awaiting approval.\n\n"
+                    f"Hostname: {device['hostname']}\n"
+                    f"Friendly name: {device['friendly_name'] or '(none given)'}\n"
+                    f"Source IP: {source_ip}\n"
+                ),
+            )
 
             return {
                 "result": "accepted_pending",
@@ -2532,6 +2713,7 @@ def complete_device_reenrollment(
                 },
             )
             connection.commit()
+            _notify_device_pending(updated)
             return {
                 "result": "accepted_pending",
                 "device": updated,
@@ -2689,6 +2871,31 @@ def enrollment_status(
             return response
 
 
+def device_lifetime_stats(cursor, *, device_id: uuid.UUID) -> dict[str, int]:
+    """Lifetime counts for Client Management's MSG/Conn column.
+
+    Messages: from chat_message_send_events (count-only, no body - see its
+    own table comment). Connections: from device_activity_events, the same
+    table the dashboard's 24h/7-day connection stats already read from.
+    """
+    cursor.execute(
+        "SELECT COUNT(*) AS count FROM chat_message_send_events WHERE sender_device_id = %s",
+        (device_id,),
+    )
+    messages = cursor.fetchone()["count"]
+
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS count FROM device_activity_events
+        WHERE device_id = %s AND event_type = 'connection.established'
+        """,
+        (device_id,),
+    )
+    connections = cursor.fetchone()["count"]
+
+    return {"lifetime_messages_sent": messages, "lifetime_connections": connections}
+
+
 def device_active_connections(
     cursor,
     *,
@@ -2795,6 +3002,7 @@ def list_devices(
                     rustdesk_id=item["rustdesk_id"],
                     now=now,
                 )
+                item.update(device_lifetime_stats(cursor, device_id=item["id"]))
 
             return {"items": items}
 
@@ -3535,6 +3743,47 @@ def approved_directory(
                     and last_seen >= online_cutoff
                 )
 
+            # Batched (not per-device) lookup of who each approved device is
+            # currently in an active session with, so RDC's own peer list can
+            # show an "in session" indicator - mirrors device_active_connections()
+            # used by the /ops admin dashboard, but as a single query covering
+            # every device at once rather than one query per device, since this
+            # endpoint is polled by every client on every refresh.
+            session_cutoff = now - timedelta(seconds=PRESENCE_TIMEOUT_SECONDS)
+            cursor.execute(
+                """
+                SELECT reporting_device_id AS device_id, peer_name FROM (
+                    SELECT
+                        s.reporting_device_id,
+                        COALESCE(peer.friendly_name, peer.hostname, 'Unknown peer') AS peer_name
+                    FROM device_active_sessions s
+                    LEFT JOIN managed_devices peer
+                      ON peer.rustdesk_id = s.peer_rustdesk_id
+                    WHERE s.ended_at IS NULL
+                      AND s.last_heartbeat_at >= %s
+
+                    UNION ALL
+
+                    SELECT
+                        peer.id AS reporting_device_id,
+                        COALESCE(reporting.friendly_name, reporting.hostname, 'Unknown peer') AS peer_name
+                    FROM device_active_sessions s
+                    JOIN managed_devices reporting
+                      ON reporting.id = s.reporting_device_id
+                    JOIN managed_devices peer
+                      ON peer.rustdesk_id = s.peer_rustdesk_id
+                    WHERE s.ended_at IS NULL
+                      AND s.last_heartbeat_at >= %s
+                ) combined
+                """,
+                (session_cutoff, session_cutoff),
+            )
+            active_peer_by_device = {}
+            for row in cursor.fetchall():
+                active_peer_by_device.setdefault(row["device_id"], row["peer_name"])
+            for item in devices:
+                item["active_session_peer"] = active_peer_by_device.get(item["id"])
+
             cursor.execute(
                 """
                 SELECT
@@ -3581,8 +3830,20 @@ def approved_directory(
             }
 
 
-def load_update_manifest(channel: str) -> dict[str, Any]:
-    path = safe_update_file(UPDATE_MANIFESTS, f"{channel}.json")
+def load_update_manifest(channel: str, arch: str) -> dict[str, Any]:
+    require_arch_field = True
+    try:
+        path = safe_update_file(UPDATE_MANIFESTS, f"{channel}-{arch}.json")
+    except HTTPException as error:
+        if error.status_code != status.HTTP_404_NOT_FOUND or arch != "x86_64":
+            raise
+        # Pre-arch-aware manifests (published before this server understood
+        # architectures) only ever exist under the plain channel name and only
+        # ever described x86_64 builds. Fall back so already-deployed x64
+        # clients keep working until the channel is republished with --arch.
+        path = safe_update_file(UPDATE_MANIFESTS, f"{channel}.json")
+        require_arch_field = False
+
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -3607,6 +3868,8 @@ def load_update_manifest(channel: str) -> dict[str, Any]:
         "signature",
         "published_at",
     }
+    if require_arch_field:
+        required = required | {"arch"}
     if not required.issubset(manifest):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -3617,6 +3880,12 @@ def load_update_manifest(channel: str) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Managed update manifest channel mismatch",
+        )
+
+    if require_arch_field and manifest.get("arch") != arch:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Managed update manifest architecture mismatch",
         )
 
     file_name = str(manifest.get("file_name", ""))
@@ -3658,11 +3927,12 @@ def load_update_manifest(channel: str) -> dict[str, Any]:
 @app.get("/v1/updates/latest")
 def managed_update_latest(
     channel: str = Query(default="stable", pattern=r"^(stable|pilot)$"),
+    arch: str = Query(default="x86_64", pattern=r"^(x86_64|aarch64)$"),
     device: dict[str, Any] = Depends(require_device),
 ):
     del device
     try:
-        manifest = load_update_manifest(channel)
+        manifest = load_update_manifest(channel, arch)
     except HTTPException as error:
         if error.status_code == status.HTTP_404_NOT_FOUND:
             return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -4484,7 +4754,7 @@ def list_operator_accounts(
 @app.get("/v1/operators/{account_id}")
 def get_operator_account(
     account_id: uuid.UUID,
-    operator: dict[str, Any] = Depends(require_operator),
+    operator: dict[str, Any] = Depends(require_full_scope_operator),
 ):
     authorize_operator_self_or_owner(operator, account_id)
     with open_database() as connection:
@@ -5769,6 +6039,405 @@ def cancel_operator_role_change_request(
             connection.commit()
             return response
 
+
+# --- OUTBOUND MAIL (Mailcow integration groundwork) ---
+# Brad-only, not owner-only - see require_brad_only.
+
+class SmtpConfigUpdate(BaseModel):
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(ge=1, le=65535)
+    use_tls: bool = True
+    username: str | None = None
+    # None = leave the stored password untouched. "" = explicitly clear it.
+    # Anything else = replace it.
+    password: str | None = None
+    from_address: str = Field(min_length=3, max_length=255)
+    enabled: bool = False
+
+
+class SmtpTestRequest(BaseModel):
+    # All optional - omitted fields fall back to whatever is already saved,
+    # so Test Connection works either against in-progress edits or the
+    # stored config, without requiring a save first.
+    host: str | None = None
+    port: int | None = None
+    use_tls: bool | None = None
+    username: str | None = None
+    password: str | None = None
+    from_address: str | None = None
+    test_recipient: str = Field(min_length=3, max_length=255)
+
+
+def _smtp_config_response(cursor) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT host, port, use_tls, username, from_address, enabled,
+               password_ciphertext IS NOT NULL AS has_password,
+               updated_at
+        FROM smtp_config
+        WHERE id = 1
+        """
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return {
+            "host": None,
+            "port": None,
+            "use_tls": True,
+            "username": None,
+            "from_address": None,
+            "enabled": False,
+            "has_password": False,
+            "updated_at": None,
+        }
+    return dict(row)
+
+
+@app.get("/ops/api/smtp-config")
+def get_smtp_config(
+    operator: dict[str, Any] = Depends(require_admin_cookie_brad_only),
+):
+    with open_database() as connection:
+        with connection.cursor() as cursor:
+            return _smtp_config_response(cursor)
+
+
+@app.put("/ops/api/smtp-config")
+def update_smtp_config(
+    payload: SmtpConfigUpdate,
+    request: Request,
+    operator: dict[str, Any] = Depends(require_admin_cookie_brad_only),
+):
+    if payload.password not in (None, "") and not SMTP_ENCRYPTION_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="SMTP_ENCRYPTION_SECRET is not configured on the server",
+        )
+
+    source_ip = client_ip(request)
+    now = datetime.now(timezone.utc)
+
+    if payload.password is None:
+        password_value_sql = "NULL"
+        password_update_sql = "smtp_config.password_ciphertext"
+        password_params: tuple[Any, ...] = ()
+    elif payload.password == "":
+        password_value_sql = "NULL"
+        password_update_sql = "NULL"
+        password_params = ()
+    else:
+        password_value_sql = "pgp_sym_encrypt(%s, %s)"
+        password_update_sql = "EXCLUDED.password_ciphertext"
+        password_params = (payload.password, SMTP_ENCRYPTION_SECRET)
+
+    with open_database() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO smtp_config (
+                    id, host, port, use_tls, username, password_ciphertext,
+                    from_address, enabled, updated_at, updated_by_account_id
+                )
+                VALUES (
+                    1, %s, %s, %s, %s, {password_value_sql},
+                    %s, %s, %s, %s
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    host = EXCLUDED.host,
+                    port = EXCLUDED.port,
+                    use_tls = EXCLUDED.use_tls,
+                    username = EXCLUDED.username,
+                    password_ciphertext = {password_update_sql},
+                    from_address = EXCLUDED.from_address,
+                    enabled = EXCLUDED.enabled,
+                    updated_at = EXCLUDED.updated_at,
+                    updated_by_account_id = EXCLUDED.updated_by_account_id
+                """,
+                (
+                    payload.host,
+                    payload.port,
+                    payload.use_tls,
+                    payload.username,
+                    *password_params,
+                    payload.from_address,
+                    payload.enabled,
+                    now,
+                    operator["account_id"],
+                ),
+            )
+
+            write_audit(
+                cursor,
+                "smtp.config_updated",
+                actor_account_id=operator["account_id"],
+                # No target_type/target_id: smtp_config is a singleton with
+                # no UUID row id, and audit_events_target_pair_check requires
+                # target_type and target_id to be both null or both set.
+                source_ip=source_ip,
+                details={
+                    "host": payload.host,
+                    "port": payload.port,
+                    "enabled": payload.enabled,
+                    "password_changed": bool(payload.password),
+                    "password_cleared": payload.password == "",
+                },
+            )
+            connection.commit()
+            return _smtp_config_response(cursor)
+
+
+def _send_mail(
+    *,
+    host: str,
+    port: int,
+    use_tls: bool,
+    username: str | None,
+    password: str | None,
+    from_address: str,
+    to_address: str,
+    subject: str,
+    body: str,
+) -> None:
+    message = MIMEText(body)
+    message["Subject"] = subject
+    message["From"] = from_address
+    message["To"] = to_address
+
+    with smtplib.SMTP(host, port, timeout=10) as server:
+        if use_tls:
+            server.starttls(context=ssl.create_default_context())
+        if username and password:
+            server.login(username, password)
+        server.sendmail(from_address, [to_address], message.as_string())
+
+
+def _send_smtp_test(
+    *,
+    host: str,
+    port: int,
+    use_tls: bool,
+    username: str | None,
+    password: str | None,
+    from_address: str,
+    test_recipient: str,
+) -> None:
+    _send_mail(
+        host=host,
+        port=port,
+        use_tls=use_tls,
+        username=username,
+        password=password,
+        from_address=from_address,
+        to_address=test_recipient,
+        subject="RustDesk Directory - SMTP test",
+        body=(
+            "This is a test message from the RustDesk Directory admin console, "
+            "confirming outbound SMTP delivery is working."
+        ),
+    )
+
+
+def _send_alert_email(*, subject: str, body: str) -> None:
+    # Best-effort only, same as push notifications elsewhere in this file -
+    # an alert email must never break the caller (enrollment, a health-event
+    # report, a backup timer). Always goes to Brad's own account email; this
+    # is a Brad-only feature (see the Mail settings page) with one recipient.
+    if not SMTP_ENCRYPTION_SECRET:
+        return
+    try:
+        with open_database() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT host, port, use_tls, username, from_address, enabled,
+                        CASE
+                            WHEN password_ciphertext IS NULL THEN NULL
+                            ELSE pgp_sym_decrypt(password_ciphertext, %s)
+                        END AS password
+                    FROM smtp_config
+                    WHERE id = 1
+                    """,
+                    (SMTP_ENCRYPTION_SECRET,),
+                )
+                config = cursor.fetchone()
+                if (
+                    not config
+                    or not config["enabled"]
+                    or not config["host"]
+                    or not config["port"]
+                    or not config["from_address"]
+                ):
+                    return
+
+                cursor.execute(
+                    "SELECT email FROM operator_accounts WHERE id = %s",
+                    (PROTECTED_BRAD_ACCOUNT_ID,),
+                )
+                recipient_row = cursor.fetchone()
+
+        recipient = recipient_row["email"] if recipient_row else None
+        if not recipient:
+            return
+
+        _send_mail(
+            host=config["host"],
+            port=config["port"],
+            use_tls=config["use_tls"],
+            username=config["username"],
+            password=config["password"],
+            from_address=config["from_address"],
+            to_address=recipient,
+            subject=subject,
+            body=body,
+        )
+    except Exception:
+        pass
+
+
+@app.post("/ops/api/smtp-config/test")
+def test_smtp_config(
+    payload: SmtpTestRequest,
+    operator: dict[str, Any] = Depends(require_admin_cookie_brad_only),
+):
+    with open_database() as connection:
+        with connection.cursor() as cursor:
+            if SMTP_ENCRYPTION_SECRET:
+                cursor.execute(
+                    """
+                    SELECT host, port, use_tls, username, from_address,
+                        CASE
+                            WHEN password_ciphertext IS NULL THEN NULL
+                            ELSE pgp_sym_decrypt(password_ciphertext, %s)
+                        END AS password
+                    FROM smtp_config
+                    WHERE id = 1
+                    """,
+                    (SMTP_ENCRYPTION_SECRET,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT host, port, use_tls, username, from_address,
+                           NULL AS password
+                    FROM smtp_config
+                    WHERE id = 1
+                    """
+                )
+            stored = cursor.fetchone() or {}
+
+    host = payload.host or stored.get("host")
+    port = payload.port or stored.get("port")
+    use_tls = (
+        payload.use_tls if payload.use_tls is not None
+        else stored.get("use_tls", True)
+    )
+    username = (
+        payload.username if payload.username is not None
+        else stored.get("username")
+    )
+    password = (
+        payload.password if payload.password is not None
+        else stored.get("password")
+    )
+    from_address = payload.from_address or stored.get("from_address")
+
+    if not host or not port or not from_address:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Host, port, and a From address are required to test",
+        )
+
+    try:
+        _send_smtp_test(
+            host=host,
+            port=port,
+            use_tls=use_tls,
+            username=username,
+            password=password,
+            from_address=from_address,
+            test_recipient=payload.test_recipient,
+        )
+        return {
+            "success": True,
+            "message": f"Test message sent to {payload.test_recipient}.",
+        }
+    except (smtplib.SMTPException, OSError, TimeoutError) as error:
+        return {"success": False, "message": str(error)}
+
+
+CONNECTION_EVENT_TYPES = (
+    "connection.established",
+    "connection.rejected",
+    "connection.denied",
+    "connection.ended",
+)
+
+
+@app.get("/ops/api/dashboard-summary")
+def get_dashboard_summary(
+    operator: dict[str, Any] = Depends(require_admin_cookie_operator),
+):
+    del operator
+
+    with open_database() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM managed_devices
+                GROUP BY status
+                """
+            )
+            device_status_counts = {
+                row["status"]: row["count"] for row in cursor.fetchall()
+            }
+
+            cursor.execute(
+                """
+                SELECT event_type, COUNT(*) AS count
+                FROM device_activity_events
+                WHERE event_type = ANY(%s)
+                  AND occurred_at >= now() - interval '24 hours'
+                GROUP BY event_type
+                """,
+                (list(CONNECTION_EVENT_TYPES),),
+            )
+            connection_stats_24h = {
+                row["event_type"].split(".", 1)[1]: row["count"]
+                for row in cursor.fetchall()
+            }
+
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE occurred_at >= now() - interval '7 days') AS last_7d,
+                    COUNT(*) AS lifetime
+                FROM device_activity_events
+                WHERE event_type = 'connection.established'
+                """
+            )
+            conn_row = cursor.fetchone()
+
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE sent_at >= now() - interval '7 days') AS last_7d,
+                    COUNT(*) AS lifetime
+                FROM chat_message_send_events
+                """
+            )
+            msg_row = cursor.fetchone()
+
+    return {
+        "device_status_counts": device_status_counts,
+        "connection_stats_24h": connection_stats_24h,
+        "connections_established_7d": conn_row["last_7d"],
+        "connections_established_lifetime": conn_row["lifetime"],
+        "messages_sent_7d": msg_row["last_7d"],
+        "messages_sent_lifetime": msg_row["lifetime"],
+    }
+
+
 # BEGIN RustDesk Directory Security Extension v0.7.0
 from security_extension import register_security_extension as _register_security_extension
 
@@ -5823,5 +6492,37 @@ register_admin_routes(
     open_database_handler=open_database,
     write_audit_handler=write_audit,
     client_ip_handler=client_ip,
+)
+
+# --- MOBILE COMPANION APP (client-manager Android app) ---
+from mobile_api import register_mobile_routes
+
+register_mobile_routes(
+    app=app,
+    login_handler=_perform_login,
+    refresh_handler=refresh,
+    logout_handler=logout,
+    require_operator_handler=require_operator,
+    require_device_manager_handler=require_device_manager,
+    list_devices_handler=list_devices,
+    approve_device_handler=approve_device,
+    block_device_handler=block_device,
+    revoke_device_handler=revoke_device,
+    open_database_handler=open_database,
+    client_ip_handler=client_ip,
+    health_watcher_secret=HEALTH_WATCHER_SHARED_SECRET,
+    firebase_service_account=FIREBASE_SERVICE_ACCOUNT,
+    firebase_project_id=FIREBASE_PROJECT_ID,
+    send_email_handler=_send_alert_email,
+)
+
+# --- MANAGED CHAT (out-of-session messaging between managed devices) ---
+from managed_chat import register_chat_routes
+
+register_chat_routes(
+    app=app,
+    require_device_handler=require_device,
+    validate_device_credential_handler=validate_device_credential,
+    open_database_handler=open_database,
 )
 

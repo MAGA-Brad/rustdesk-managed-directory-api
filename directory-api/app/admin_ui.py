@@ -2036,6 +2036,142 @@ ADMIN_HTML = r"""<!doctype html>
       border-color: rgba(240,99,104,.3);
       background: rgba(240,99,104,.08);
     }
+    .rustdesk-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--accent);
+      text-decoration: none;
+      padding: 3px 9px 3px 7px;
+      border-radius: 999px;
+      background: rgba(79,163,255,.1);
+      border: 1px solid rgba(79,163,255,.28);
+    }
+    .rustdesk-link:hover {
+      background: rgba(79,163,255,.18);
+      border-color: rgba(79,163,255,.5);
+    }
+    .rustdesk-link .connect-hint {
+      font-size: 10px;
+      opacity: .85;
+    }
+    .smtp-form {
+      max-width: 440px;
+      display: flex;
+      flex-direction: column;
+    }
+    .smtp-form label {
+      display: block;
+    }
+    .smtp-form .checkbox-field {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 16px 0 7px;
+      color: var(--text);
+      font-size: 14px;
+    }
+    .smtp-form input[type="checkbox"] {
+      width: auto;
+      height: auto;
+      padding: 0;
+      background: none;
+      border: none;
+      accent-color: var(--accent);
+    }
+    .smtp-form .action-row {
+      margin-top: 22px;
+    }
+    .smtp-save {
+      color: white;
+      background: linear-gradient(135deg, #278df8, #6467f2);
+      border-color: transparent;
+    }
+    .dashboard-panel { margin-top: 22px; }
+    .dash-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-top: 6px;
+    }
+    .dash-card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px 18px;
+      background: rgba(23,38,58,.5);
+    }
+    .dash-card h3 {
+      margin: 0 0 12px;
+      font-size: 13px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .dash-card-wide { grid-column: 1 / -1; }
+    .dist-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 9px;
+      font-size: 13px;
+    }
+    .dist-row:last-child { margin-bottom: 0; }
+    .dist-label { width: 74px; color: var(--muted); flex: none; }
+    .dist-bar {
+      flex: 1;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--panel-2);
+      overflow: hidden;
+    }
+    .dist-fill { height: 100%; border-radius: 999px; }
+    .dist-fill.approved { background: var(--good); }
+    .dist-fill.pending { background: var(--warn); }
+    .dist-fill.blocked, .dist-fill.revoked, .dist-fill.denied { background: var(--bad); }
+    .dist-count { width: 28px; text-align: right; flex: none; font-weight: 700; }
+    .dash-stat-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 14px;
+    }
+    .dash-stat-value {
+      font-size: 26px;
+      font-weight: 800;
+    }
+    .dash-stat-value.good { color: var(--good); }
+    .dash-stat-value.bad { color: var(--bad); }
+    .dash-stat-label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 2px;
+    }
+    .trend-svg {
+      width: 100%;
+      height: 240px;
+      display: block;
+    }
+    .trend-legend {
+      display: flex;
+      gap: 16px;
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .trend-legend .swatch {
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 2px;
+      margin-right: 5px;
+    }
+    .dash-table-wrap { margin-top: 20px; }
+    .dash-table-title {
+      margin: 0 0 10px;
+      font-size: 13px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
     .action-row {
       display: flex;
       gap: 7px;
@@ -2197,6 +2333,7 @@ ADMIN_HTML = r"""<!doctype html>
     }
   
     .owner-only.hidden-by-role { display: none !important; }
+    .brad-only.hidden-by-role { display: none !important; }
     .permissions-panel { margin-top: 24px; }
     .permission-stats { margin-top: 24px; }
     .compact-panel { margin-top: 18px; }
@@ -2473,6 +2610,11 @@ ADMIN_HTML = r"""<!doctype html>
           </span>
           <span id="operatorText" class="operator"></span>
           <button
+            id="myAccountButton"
+            class="secondary"
+            type="button"
+          >My Account</button>
+          <button
             id="refreshButton"
             class="secondary"
             type="button"
@@ -2496,6 +2638,11 @@ ADMIN_HTML = r"""<!doctype html>
           data-tab="security"
           type="button"
         >Activity</button>
+        <button
+          class="tab brad-only"
+          data-tab="mail"
+          type="button"
+        >Mail</button>
       </nav>
 
       <section id="clientsTab" class="tab-view">
@@ -2526,6 +2673,11 @@ ADMIN_HTML = r"""<!doctype html>
                 class="secondary owner-only"
                 type="button"
               >Authorize re-enrollment</button>
+              <button
+                id="exportClientsButton"
+                class="secondary"
+                type="button"
+              >Export CSV</button>
             </div>
           </div>
           <div class="table-wrap">
@@ -2540,6 +2692,7 @@ ADMIN_HTML = r"""<!doctype html>
                   <th>Last seen</th>
                   <th>Credential</th>
                   <th>Actions</th>
+                  <th title="Lifetime messages sent / lifetime established connections">MSG/Conn</th>
                   <th>Connected To</th>
                 </tr>
               </thead>
@@ -2697,6 +2850,60 @@ ADMIN_HTML = r"""<!doctype html>
             </div>
           </div>
         </section>
+
+        <section class="panel dashboard-panel">
+          <div class="panel-head">
+            <div>
+              <h2>Fleet Overview</h2>
+              <p>Client status distribution, recent connection activity, and a 7-day trend.</p>
+            </div>
+          </div>
+
+          <div class="dash-grid">
+            <div class="dash-card">
+              <h3>Client Status</h3>
+              <div id="distributionRows"></div>
+            </div>
+
+            <div class="dash-card">
+              <h3>Connections (last 24h)</h3>
+              <div class="dash-stat-grid">
+                <div class="dash-stat">
+                  <div id="conn24Established" class="dash-stat-value good">0</div>
+                  <div class="dash-stat-label">Established</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="dash-card">
+              <h3>Established Connections</h3>
+              <div class="dash-stat-grid">
+                <div class="dash-stat">
+                  <div id="connections7d" class="dash-stat-value good">0</div>
+                  <div class="dash-stat-label">Last 7 days</div>
+                </div>
+                <div class="dash-stat">
+                  <div id="connectionsLifetime" class="dash-stat-value good">0</div>
+                  <div class="dash-stat-label">Lifetime</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="dash-card">
+              <h3>Messages Sent</h3>
+              <div class="dash-stat-grid">
+                <div class="dash-stat">
+                  <div id="messages7d" class="dash-stat-value good">0</div>
+                  <div class="dash-stat-label">Last 7 days</div>
+                </div>
+                <div class="dash-stat">
+                  <div id="messagesLifetime" class="dash-stat-value good">0</div>
+                  <div class="dash-stat-label">Lifetime</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
       </section>
 
       <section id="securityTab" class="tab-view hidden owner-only">
@@ -2722,6 +2929,11 @@ ADMIN_HTML = r"""<!doctype html>
                 placeholder="Search client, peer, actor, IP, or details"
                 aria-label="Search activity"
               >
+              <button
+                id="exportActivityButton"
+                class="secondary"
+                type="button"
+              >Export CSV</button>
             </div>
           </div>
           <div class="table-wrap">
@@ -2747,6 +2959,53 @@ ADMIN_HTML = r"""<!doctype html>
           Showing the newest 150 events. Audit records cannot be
           updated, deleted, or truncated.
         </p>
+      </section>
+
+      <section id="mailTab" class="tab-view hidden brad-only">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Mail</h2>
+              <p>
+                Outbound SMTP for system notifications - groundwork for
+                Mailcow integration. Visible only to this account.
+              </p>
+            </div>
+          </div>
+          <form id="smtpForm" class="smtp-form" autocomplete="off">
+            <label>Server address
+              <input id="smtpHost" type="text" placeholder="mail.example.com" autocomplete="off">
+            </label>
+            <label>Port
+              <input id="smtpPort" type="number" min="1" max="65535" placeholder="587">
+            </label>
+            <label class="checkbox-field">
+              <input id="smtpUseTls" type="checkbox" checked>
+              Use STARTTLS
+            </label>
+            <label>Username
+              <input id="smtpUsername" type="text" autocomplete="off">
+            </label>
+            <label>Password
+              <input id="smtpPassword" type="password" placeholder="Leave blank to keep the current password" autocomplete="new-password">
+            </label>
+            <label>From address
+              <input id="smtpFrom" type="email" placeholder="rustdesk@example.com">
+            </label>
+            <label class="checkbox-field">
+              <input id="smtpEnabled" type="checkbox">
+              Enabled
+            </label>
+            <p id="smtpMeta" class="sub"></p>
+            <label>Send a test message to
+              <input id="smtpTestRecipient" type="email" placeholder="you@example.com">
+            </label>
+            <div class="action-row">
+              <button id="smtpSaveButton" class="secondary smtp-save" type="button">Save</button>
+              <button id="smtpTestButton" class="secondary" type="button">Test Connection</button>
+            </div>
+          </form>
+        </section>
       </section>
 
     </section>
@@ -3113,6 +3372,7 @@ ADMIN_HTML = r"""<!doctype html>
     const blockedRevokedEmpty = document.getElementById(
       "blockedRevokedEmpty"
     );
+    const distributionRows = document.getElementById("distributionRows");
     const operatorRows = document.getElementById("operatorRows");
     const operatorModal = document.getElementById("operatorModal");
     const operatorDetailGrid = document.getElementById("operatorDetailGrid");
@@ -3164,6 +3424,51 @@ ADMIN_HTML = r"""<!doctype html>
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
+    }
+
+    const CSV_EXPORT_ROW_LIMIT = 1000;
+
+    function csvCell(value) {
+      let text = value === null || value === undefined ? "" : String(value);
+      // Neutralize CSV/formula injection: a cell opened by Excel/Sheets that
+      // starts with one of these characters can execute as a formula.
+      if (/^[=+\-@\t\r]/.test(text)) {
+        text = `'${text}`;
+      }
+      return `"${text.replaceAll('"', '""')}"`;
+    }
+
+    function downloadCsv(filename, columns, rows) {
+      if (!rows.length) {
+        showToast("Nothing to export.", true);
+        return;
+      }
+      if (rows.length > CSV_EXPORT_ROW_LIMIT) {
+        const proceed = window.confirm(
+          `This export has ${rows.length} rows. Only the first `
+          + `${CSV_EXPORT_ROW_LIMIT} will be included. Continue?`
+        );
+        if (!proceed) return;
+      }
+      const limited = rows.slice(0, CSV_EXPORT_ROW_LIMIT);
+      const lines = [
+        columns.map(col => csvCell(col.label)).join(","),
+        ...limited.map(
+          row => columns.map(col => csvCell(col.value(row))).join(",")
+        )
+      ];
+      const blob = new Blob(
+        [lines.join("\r\n")],
+        { type: "text/csv;charset=utf-8;" }
+      );
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
     }
 
     function showToast(message, bad = false) {
@@ -3425,6 +3730,16 @@ ADMIN_HTML = r"""<!doctype html>
       return currentOperator && currentOperator.role === "owner";
     }
 
+    function isBrad() {
+      // Mail/SMTP settings are restricted to Brad's specific account, not
+      // the owner role in general - several other accounts (michael,
+      // bradpixel, brady) also hold "owner" but must not see mail
+      // credentials. The backend enforces this independently
+      // (require_brad_only); this is just matching visibility to it.
+      return currentOperator
+        && String(currentOperator.username || "").toLowerCase() === "brad";
+    }
+
     function canApproveDevices() {
       return currentOperator
         && ["owner", "manager"].includes(currentOperator.role);
@@ -3432,18 +3747,24 @@ ADMIN_HTML = r"""<!doctype html>
 
     function applyRoleVisibility() {
       const owner = isOwner();
+      const brad = isBrad();
 
       document.querySelectorAll(".owner-only").forEach(element => {
         element.classList.toggle("hidden-by-role", !owner);
       });
+      document.querySelectorAll(".brad-only").forEach(element => {
+        element.classList.toggle("hidden-by-role", !brad);
+      });
 
-      if (!owner) {
-        const activeTab = document.querySelector(".tab.active");
-        if (activeTab && activeTab.dataset.tab !== "clients") {
-          document.querySelector(
-            '.tab[data-tab="clients"]'
-          ).click();
-        }
+      const activeTab = document.querySelector(".tab.active");
+      const activeTabName = activeTab && activeTab.dataset.tab;
+      const activeTabBlocked =
+        (activeTabName === "security" && !owner)
+        || (activeTabName === "mail" && !brad);
+      if (activeTabBlocked) {
+        document.querySelector(
+          '.tab[data-tab="clients"]'
+        ).click();
       }
     }
 
@@ -3522,9 +3843,19 @@ ADMIN_HTML = r"""<!doctype html>
       const managed = deviceItems.filter(
         item => ["approved", "pending"].includes(item.status)
       );
-      const filtered = selected
-        ? managed.filter(item => item.status === selected)
-        : managed;
+      const filtered = (
+        selected
+          ? managed.filter(item => item.status === selected)
+          : managed
+      ).slice().sort((a, b) => {
+        const nameA = (
+          a.friendly_name || a.hostname || "Unnamed client"
+        ).toLowerCase();
+        const nameB = (
+          b.friendly_name || b.hostname || "Unnamed client"
+        ).toLowerCase();
+        return nameA.localeCompare(nameB);
+      });
 
       deviceEmpty.classList.toggle(
         "hidden",
@@ -3551,7 +3882,11 @@ ADMIN_HTML = r"""<!doctype html>
               <div class="name">${escapeHtml(name)}</div>
               <div class="sub">${escapeHtml(host)}</div>
             </td>
-            <td>${escapeHtml(device.rustdesk_id || "-")}</td>
+            <td>${
+              device.rustdesk_id && device.status === "approved"
+                ? `<a class="rustdesk-link" href="rustdesk://${escapeHtml(device.rustdesk_id)}" title="Open a direct session with this client">${escapeHtml(device.rustdesk_id)} <span class="connect-hint">&#8599; Connect</span></a>`
+                : escapeHtml(device.rustdesk_id || "-")
+            }</td>
             <td>
               <span class="badge ${statusName}">
                 ${statusName}
@@ -3586,6 +3921,11 @@ ADMIN_HTML = r"""<!doctype html>
                 ${deviceActionButtons(device)}
               </div>
             </td>
+            <td title="Lifetime messages sent / lifetime established connections">${
+              Number(device.lifetime_messages_sent || 0)
+            }/${
+              Number(device.lifetime_connections || 0)
+            }</td>
             <td>${connectedToHtml(device)}</td>
           </tr>`;
       }).join("");
@@ -3621,6 +3961,44 @@ ADMIN_HTML = r"""<!doctype html>
       }).join("");
     }
 
+
+
+    function renderDistribution(counts) {
+      const order = [
+        ["approved", "Approved"],
+        ["pending", "Pending"],
+        ["blocked", "Blocked"],
+        ["revoked", "Revoked"],
+        ["denied", "Denied"]
+      ];
+      const total = order.reduce(
+        (sum, [key]) => sum + Number(counts[key] || 0),
+        0
+      ) || 1;
+
+      distributionRows.innerHTML = order.map(([key, label]) => {
+        const count = Number(counts[key] || 0);
+        const pct = Math.round((count / total) * 100);
+        return `
+          <div class="dist-row">
+            <span class="dist-label">${label}</span>
+            <div class="dist-bar"><div class="dist-fill ${key}" style="width:${pct}%"></div></div>
+            <span class="dist-count">${count}</span>
+          </div>`;
+      }).join("");
+    }
+
+    function renderDashboardSummary(data) {
+      renderDistribution(data.device_status_counts || {});
+
+      const conn = data.connection_stats_24h || {};
+      document.getElementById("conn24Established").textContent = conn.established || 0;
+
+      document.getElementById("connections7d").textContent = data.connections_established_7d || 0;
+      document.getElementById("connectionsLifetime").textContent = data.connections_established_lifetime || 0;
+      document.getElementById("messages7d").textContent = data.messages_sent_7d || 0;
+      document.getElementById("messagesLifetime").textContent = data.messages_sent_lifetime || 0;
+    }
 
     function closeDeviceModal() {
       deviceModal.classList.add("hidden");
@@ -4054,6 +4432,36 @@ ADMIN_HTML = r"""<!doctype html>
       return labels[eventType] || eventType || "Event";
     }
 
+    const EVENT_SEVERITY_BAD = new Set([
+      "operator.login_failed",
+      "operator.sessions_revoked",
+      "operator.disabled",
+      "operator.deleted",
+      "operator.protected_lifecycle_change_blocked",
+      "connection.rejected",
+      "connection.denied",
+      "device.deleted"
+    ]);
+    const EVENT_SEVERITY_WARN = new Set([
+      "operator.access_reset_created",
+      "operator.self_access_reset_created",
+      "operator.role_change_completed"
+    ]);
+    const EVENT_SEVERITY_GOOD = new Set([
+      "operator.login_succeeded",
+      "operator.enabled",
+      "operator.unlocked",
+      "operator.access_reset_completed",
+      "client.active",
+      "connection.established"
+    ]);
+    function eventSeverityClass(eventType) {
+      if (EVENT_SEVERITY_BAD.has(eventType)) return "blocked";
+      if (EVENT_SEVERITY_WARN.has(eventType)) return "pending";
+      if (EVENT_SEVERITY_GOOD.has(eventType)) return "active";
+      return "";
+    }
+
     function operatorSessionState(item) {
       if (item.revoked_at) {
         return `Revoked${item.revocation_reason ? ` — ${item.revocation_reason}` : ""}`;
@@ -4062,6 +4470,14 @@ ADMIN_HTML = r"""<!doctype html>
         return "Expired";
       }
       return "Active";
+    }
+
+    function operatorSessionStateClass(item) {
+      if (item.revoked_at) return "blocked";
+      if (item.expires_at && new Date(item.expires_at).getTime() <= Date.now()) {
+        return "pending";
+      }
+      return "active";
     }
 
     function renderOperatorDetail(result) {
@@ -4138,12 +4554,12 @@ ADMIN_HTML = r"""<!doctype html>
 
       operatorHistoryEmpty.classList.toggle("hidden", history.length !== 0);
       operatorHistoryRows.innerHTML = history.map(item => `
-        <tr><td>${escapeHtml(formatDate(item.created_at))}</td><td>${escapeHtml(managerEventLabel(item.event_type))}</td><td>${escapeHtml(item.actor_username || "System")}</td><td>${escapeHtml(item.source_ip || "-")}</td><td><pre class="audit-details">${escapeHtml(formatDetails(item.details))}</pre></td></tr>
+        <tr><td>${escapeHtml(formatDate(item.created_at))}</td><td><span class="badge ${eventSeverityClass(item.event_type)}">${escapeHtml(managerEventLabel(item.event_type))}</span></td><td>${escapeHtml(item.actor_username || "System")}</td><td>${escapeHtml(item.source_ip || "-")}</td><td><pre class="audit-details">${escapeHtml(formatDetails(item.details))}</pre></td></tr>
       `).join("");
 
       operatorSessionEmpty.classList.toggle("hidden", sessions.length !== 0);
       operatorSessionRows.innerHTML = sessions.map(item => `
-        <tr><td>${escapeHtml(formatDate(item.created_at))}</td><td>${escapeHtml(formatDate(item.last_seen_at))}</td><td>${escapeHtml(formatDate(item.expires_at))}</td><td>${escapeHtml(operatorSessionState(item))}</td><td>${escapeHtml(item.source_ip || "-")}</td></tr>
+        <tr><td>${escapeHtml(formatDate(item.created_at))}</td><td>${escapeHtml(formatDate(item.last_seen_at))}</td><td>${escapeHtml(formatDate(item.expires_at))}</td><td><span class="badge ${operatorSessionStateClass(item)}">${escapeHtml(operatorSessionState(item))}</span></td><td>${escapeHtml(item.source_ip || "-")}</td></tr>
       `).join("");
     }
 
@@ -4301,7 +4717,7 @@ ADMIN_HTML = r"""<!doctype html>
           <tr>
             <td>${escapeHtml(formatDate(event.created_at))}</td>
             <td>
-              <span class="badge">
+              <span class="badge ${eventSeverityClass(event.event_type)}">
                 ${escapeHtml(activityEventLabel(event.event_type))}
               </span>
             </td>
@@ -4414,7 +4830,7 @@ ADMIN_HTML = r"""<!doctype html>
       if (tls.issuer) details.push(`Origin TLS issuer: ${tls.issuer}`);
       if (tls.subject) details.push(`Origin TLS subject: ${tls.subject}`);
       if (clientTls.not_after) {
-        details.push(`${clientTls.purpose || "Client API HTTPS"}: ${clientTls.hostname || "client"} expires ${clientTls.not_after}`);
+        details.push(`${clientTls.purpose || "Client API HTTPS"}: ${clientTls.hostname || "client.example.com"} expires ${clientTls.not_after}`);
       }
       if (clientTls.issuer) details.push(`Client API TLS issuer: ${clientTls.issuer}`);
       if (clientTls.subject) details.push(`Client API TLS subject: ${clientTls.subject}`);
@@ -5215,11 +5631,13 @@ ADMIN_HTML = r"""<!doctype html>
       const [
         summaryResponse,
         systemHealthResponse,
-        devicesResponse
+        devicesResponse,
+        dashboardSummaryResponse
       ] = await Promise.all([
         request("/summary"),
         request("/system-health"),
-        request("/devices")
+        request("/devices"),
+        request("/dashboard-summary")
       ]);
 
       if (!devicesResponse.ok) {
@@ -5236,6 +5654,9 @@ ADMIN_HTML = r"""<!doctype html>
       renderDeviceStats(summary, deviceItems);
       renderDevices();
       renderBlockedRevokedDevices();
+      if (dashboardSummaryResponse.ok) {
+        renderDashboardSummary(await dashboardSummaryResponse.json());
+      }
 
       if (systemHealthResponse.ok) {
         renderCriticalHealth(await systemHealthResponse.json());
@@ -5364,9 +5785,109 @@ ADMIN_HTML = r"""<!doctype html>
       await loadDashboard();
     });
 
+    async function loadSmtpConfig() {
+      const response = await request("/smtp-config");
+      if (!response.ok) {
+        showToast(await parseError(response), true);
+        return;
+      }
+      const config = await response.json();
+      document.getElementById("smtpHost").value = config.host || "";
+      document.getElementById("smtpPort").value = config.port || "";
+      document.getElementById("smtpUseTls").checked = config.use_tls !== false;
+      document.getElementById("smtpUsername").value = config.username || "";
+      document.getElementById("smtpPassword").value = "";
+      document.getElementById("smtpPassword").placeholder = config.has_password
+        ? "Leave blank to keep the current password"
+        : "No password set";
+      document.getElementById("smtpFrom").value = config.from_address || "";
+      document.getElementById("smtpEnabled").checked = Boolean(config.enabled);
+      document.getElementById("smtpMeta").textContent = config.updated_at
+        ? `Last saved ${formatDate(config.updated_at)}`
+        : "Not configured yet.";
+    }
+
+    function readSmtpForm() {
+      return {
+        host: document.getElementById("smtpHost").value.trim(),
+        port: Number(document.getElementById("smtpPort").value),
+        use_tls: document.getElementById("smtpUseTls").checked,
+        username: document.getElementById("smtpUsername").value.trim() || null,
+        password: document.getElementById("smtpPassword").value || null,
+        from_address: document.getElementById("smtpFrom").value.trim(),
+        enabled: document.getElementById("smtpEnabled").checked
+      };
+    }
+
+    async function saveSmtpConfig() {
+      const values = readSmtpForm();
+      if (!values.host || !values.port || !values.from_address) {
+        showToast("Server address, port, and a From address are required.", true);
+        return;
+      }
+      const button = document.getElementById("smtpSaveButton");
+      button.disabled = true;
+      try {
+        const response = await request("/smtp-config", {
+          method: "PUT",
+          body: JSON.stringify(values)
+        });
+        if (!response.ok) {
+          showToast(await parseError(response), true);
+          return;
+        }
+        showToast("Mail settings saved.");
+        await loadSmtpConfig();
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function testSmtpConfig() {
+      const recipient = document.getElementById("smtpTestRecipient").value.trim();
+      if (!recipient) {
+        showToast("Enter an address to send the test message to.", true);
+        return;
+      }
+      const values = readSmtpForm();
+      const button = document.getElementById("smtpTestButton");
+      button.disabled = true;
+      try {
+        const response = await request("/smtp-config/test", {
+          method: "POST",
+          body: JSON.stringify({
+            host: values.host || null,
+            port: values.port || null,
+            use_tls: values.use_tls,
+            username: values.username,
+            password: values.password,
+            from_address: values.from_address || null,
+            test_recipient: recipient
+          })
+        });
+        if (!response.ok) {
+          showToast(await parseError(response), true);
+          return;
+        }
+        const result = await response.json();
+        showToast(result.message, !result.success);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    document.getElementById(
+      "smtpSaveButton"
+    ).addEventListener("click", () => { void saveSmtpConfig(); });
+
+    document.getElementById(
+      "smtpTestButton"
+    ).addEventListener("click", () => { void testSmtpConfig(); });
+
     document.querySelectorAll(".tab").forEach(button => {
       button.addEventListener("click", () => {
         const tabName = button.dataset.tab;
+        if (tabName === "mail") void loadSmtpConfig();
 
         document.querySelectorAll(".tab").forEach(tab => {
           tab.classList.toggle(
@@ -5388,6 +5909,69 @@ ADMIN_HTML = r"""<!doctype html>
     document.getElementById(
       "refreshButton"
     ).addEventListener("click", loadDashboard);
+
+    document.getElementById(
+      "myAccountButton"
+    ).addEventListener("click", () => {
+      if (currentOperator && currentOperator.id) {
+        void showOperatorDetail(currentOperator.id);
+      }
+    });
+
+    document.getElementById(
+      "exportClientsButton"
+    ).addEventListener("click", () => {
+      const selected = statusFilter.value;
+      const managed = deviceItems.filter(
+        item => ["approved", "pending"].includes(item.status)
+      );
+      const rows = selected
+        ? managed.filter(item => item.status === selected)
+        : managed;
+      downloadCsv(
+        "rustdesk-clients.csv",
+        [
+          { label: "Name", value: r => r.friendly_name || r.hostname || "" },
+          { label: "Hostname", value: r => r.hostname || "" },
+          { label: "RustDesk ID", value: r => r.rustdesk_id || "" },
+          { label: "Status", value: r => r.status || "" },
+          { label: "Online", value: r => isRecent(r.last_seen_at) ? "Active" : "Inactive" },
+          { label: "Last IP", value: r => r.last_ip || "" },
+          { label: "Last Seen", value: r => formatDate(r.last_seen_at) },
+          { label: "Credential", value: r => r.has_active_credential ? "Active" : "None" }
+        ],
+        rows
+      );
+    });
+
+    document.getElementById(
+      "exportActivityButton"
+    ).addEventListener("click", () => {
+      const selected = eventFilter.value;
+      const search = auditSearch.value.trim().toLowerCase();
+      const rows = auditItems.filter(event => {
+        if (selected && event.event_type !== selected) return false;
+        if (!search) return true;
+        const haystack = [
+          event.event_type, event.actor_username, event.actor_display_name,
+          event.target_type, event.target_id, event.target_username,
+          event.target_device_name, event.source_ip, formatDetails(event.details)
+        ].join(" ").toLowerCase();
+        return haystack.includes(search);
+      });
+      downloadCsv(
+        "rustdesk-activity.csv",
+        [
+          { label: "Time", value: r => formatDate(r.created_at) },
+          { label: "Event", value: r => activityEventLabel(r.event_type) },
+          { label: "Actor", value: r => r.actor_display_name || r.actor_username || "System" },
+          { label: "Target", value: r => r.target_username || r.target_device_name || r.target_type || "" },
+          { label: "Source IP", value: r => r.source_ip || "" },
+          { label: "Details", value: r => formatDetails(r.details) }
+        ],
+        rows
+      );
+    });
 
     statusFilter.addEventListener("change", renderDevices);
     eventFilter.addEventListener("change", renderActivity);
