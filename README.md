@@ -8,42 +8,42 @@
 > - In production this is actually run via the community-maintained security-hardened build published
 >   at [rustdesk-org/rustdesk-server](https://github.com/rustdesk-org/rustdesk-server) rather than a
 >   self-built image; credit to that project and its maintainer(s) as well.
-> - This fork adds [`directory-api/`](directory-api/) — a self-hosted device directory, operator
->   enrollment/2FA, audit logging, relay-access leasing, and admin management API that sits in front
->   of the server above. See [`directory-api/README.md`](directory-api/README.md) for setup/layout
->   details.
+> - This fork adds [`directory-api/`](directory-api/) — a self-hosted Client directory, Client
+>   Manager enrollment/2FA, audit logging, relay-access leasing, and admin management API that sits
+>   in front of the server above. See [`directory-api/README.md`](directory-api/README.md) for
+>   setup/layout details.
 
 ## What `directory-api/` adds ("RDS")
 
 RDS is the management layer this fork adds in front of a stock hbbs/hbbr — it doesn't touch the
-relay/rendezvous protocol at all, it just makes running a *fleet* of RustDesk clients practical
+relay/rendezvous protocol at all, it just makes running a *fleet* of RustDesk Clients practical
 instead of a pile of individually-configured machines. It pairs with
 [rustdesk-managed-client](https://github.com/MAGA-Brad/rustdesk-managed-client) ("RDC"), a fork of
 the RustDesk client built to talk to it.
 
 ### Fleet enrollment and lifecycle
-- **Self-service, password-gated enrollment** — a device authenticates with a shared enrollment
-  secret and registers itself; nothing reaches the relay until an operator approves it.
-- **Full device lifecycle**: pending → approved, with denied/blocked/revoked as explicit terminal
-  states, each change attributed to an operator and logged.
-- **Owner-authorized re-enrollment recovery** — a device that loses or regenerates its local
-  credential isn't orphaned; an owner-role operator can authorize it to re-enroll under its
+- **Self-service, password-gated enrollment** — a Client authenticates with a shared enrollment
+  secret and registers itself; nothing reaches the relay until a Client Manager approves it.
+- **Full Client lifecycle**: pending → approved, with denied/blocked/revoked as explicit terminal
+  states, each change attributed to a Client Manager and logged.
+- **Owner-authorized re-enrollment recovery** — a Client that loses or regenerates its local
+  credential isn't orphaned; an owner-role Client Manager can authorize it to re-enroll under its
   original identity, with the prior credential invalidated the instant the new one lands.
-- **Friendly-name reservation** — human-readable device names are reserved while a device is
+- **Friendly-name reservation** — human-readable Client names are reserved while a Client is
   pending/approved/blocked and automatically released when denied/revoked, so names don't get
   permanently squatted by dead entries.
 
-### Operator accounts, not shared passwords
-- Operator accounts with roles — sensitive actions (like authorizing a re-enrollment) require the
-  **owner** role specifically, not just "logged in."
+### Client Manager accounts, not shared passwords
+- Client Manager accounts with roles — sensitive actions (like authorizing a re-enrollment) require
+  the **owner** role specifically, not just "logged in."
 - **Mandatory 2FA** on the admin/management surface.
 - **Full audit logging**: every enrollment event, status change, and admin action is recorded with
-  the acting operator and source IP — a real audit trail, not just current-state.
+  the acting Client Manager and source IP — a real audit trail, not just current-state.
 
 ### Relay access is leased, not just allowed
-- Devices get **short-lived, per-device relay-access leases** rather than a static IP allowlist — a
+- Clients get **short-lived, per-Client relay-access leases** rather than a static IP allowlist — a
   **Relay Guard** daemon syncs a dynamic firewall allowlist off active leases, so relay ports are
-  only ever open to devices with a currently-valid, currently-approved lease.
+  only ever open to Clients with a currently-valid, currently-approved lease.
 
 ### Signed updates for the managed client
 - RDS is also the **signing authority** for RDC's auto-update feature — release manifests are
@@ -66,28 +66,28 @@ the RustDesk client built to talk to it.
   a shutdown decision versus which is just monitored for visibility.
 - A **debounced alert pipeline**: every condition above only notifies on a genuine state change,
   not on every poll — so a flapping sensor doesn't turn into an alert flood, but a real failure
-  (a downed power supply, a full BMC event log, a drive dropping out of SMART-pass) reaches an
-  operator immediately by email and mobile push, with a matching "back to normal" notice when it
-  clears.
+  (a downed power supply, a full BMC event log, a drive dropping out of SMART-pass) reaches a
+  Client Manager immediately by email and mobile push, with a matching "back to normal" notice when
+  it clears.
 
 ### A companion mobile app, deliberately narrow in scope
-- **RDC Mobile Manager** lets an operator view managed devices, approve/block/revoke them, and
-  receive push notifications for new pending devices and health alerts — from a phone, with 2FA
-  login carried over from the web session model. It's intentionally scoped to device
-  management only: no operator-account administration (invites, resets, role changes) is reachable
-  from the app, since those are account-recovery-capable actions that shouldn't be exposed from a
-  device that could be lost or compromised.
+- **RDC Mobile Manager** lets a Client Manager view managed Clients, approve/block/revoke them, and
+  receive push notifications for new pending Clients and health alerts — from a phone, with 2FA
+  login carried over from the web session model. It's intentionally scoped to Client
+  management only: no Client Manager account administration (invites, resets, role changes) is
+  reachable from the app, since those are account-recovery-capable actions that shouldn't be
+  exposed from a phone that could be lost or compromised.
 
 ### Remote debug-log requests and build tracking
-- An operator can request a managed device's local debug log on demand — a single device or the
-  whole fleet at once — without needing a remote session into the machine first.
-- Client Management tracks each device's self-reported build number against the latest signed
-  release, so an out-of-date client is visible directly in the dashboard rather than discovered
+- A Client Manager can request a managed Client's local debug log on demand — a single Client or
+  the whole fleet at once — without needing a remote session into the machine first.
+- Client Management tracks each Client's self-reported build number against the latest signed
+  release, so an out-of-date Client is visible directly in the dashboard rather than discovered
   the hard way.
 
 ### Managed 1:1 chat
-- A lightweight text channel between an operator and a specific managed device, built on the same
-  directory/session model as everything else here — useful for a quick "starting your remote
+- A lightweight text channel between a Client Manager and a specific managed Client, built on the
+  same directory/session model as everything else here — useful for a quick "starting your remote
   session now" without needing a separate side channel.
 
 See [`directory-api/README.md`](directory-api/README.md) for the actual layout and first-time
