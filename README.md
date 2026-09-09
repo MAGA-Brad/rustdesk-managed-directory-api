@@ -24,8 +24,9 @@ the RustDesk client built to talk to it.
 ### Fleet enrollment and lifecycle
 - **Self-service, password-gated enrollment** — a Client authenticates with a shared enrollment
   secret and registers itself; nothing reaches the relay until a Client Manager approves it.
-- **Full Client lifecycle**: pending → approved, with denied/blocked/revoked as explicit terminal
-  states, each change attributed to a Client Manager and logged.
+- **Full Client lifecycle**: a pending Client is either **approved** or **denied** at enrollment
+  time; once approved, **blocked** is the terminal action available afterward — each change
+  attributed to a Client Manager and logged.
 - **Owner-authorized re-enrollment recovery** — a Client that loses or regenerates its local
   credential isn't orphaned; an owner-role Client Manager can authorize it to re-enroll under its
   original identity, with the prior credential invalidated the instant the new one lands.
