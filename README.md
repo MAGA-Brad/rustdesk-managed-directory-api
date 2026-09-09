@@ -57,8 +57,50 @@ the RustDesk client built to talk to it.
   splitting the public rendezvous domain, the admin/ops domain, and the managed-client API domain
   into three separately-scoped vhosts.
 
+### Server health monitoring, not just uptime
+- A live **Server Health** dashboard panel covering core services (API/DB/relay), host vitals
+  (CPU load, memory, root filesystem, uptime, pending OS updates), storage (ZFS pool health,
+  per-drive SSD wear %, SMART pass/fail, RAID controller and physical-drive status), and hardware
+  sensors (CPU temperature, fan and power-supply redundancy, BMC event log, UPS/NUT status) — down
+  to being able to watch two independent UPS units separately and choose which one actually drives
+  a shutdown decision versus which is just monitored for visibility.
+- A **debounced alert pipeline**: every condition above only notifies on a genuine state change,
+  not on every poll — so a flapping sensor doesn't turn into an alert flood, but a real failure
+  (a downed power supply, a full BMC event log, a drive dropping out of SMART-pass) reaches an
+  operator immediately by email and mobile push, with a matching "back to normal" notice when it
+  clears.
+
+### A companion mobile app, deliberately narrow in scope
+- **RDC Mobile Manager** lets an operator view managed devices, approve/block/revoke them, and
+  receive push notifications for new pending devices and health alerts — from a phone, with 2FA
+  login carried over from the web session model. It's intentionally scoped to device
+  management only: no operator-account administration (invites, resets, role changes) is reachable
+  from the app, since those are account-recovery-capable actions that shouldn't be exposed from a
+  device that could be lost or compromised.
+
+### Remote debug-log requests and build tracking
+- An operator can request a managed device's local debug log on demand — a single device or the
+  whole fleet at once — without needing a remote session into the machine first.
+- Client Management tracks each device's self-reported build number against the latest signed
+  release, so an out-of-date client is visible directly in the dashboard rather than discovered
+  the hard way.
+
+### Managed 1:1 chat
+- A lightweight text channel between an operator and a specific managed device, built on the same
+  directory/session model as everything else here — useful for a quick "starting your remote
+  session now" without needing a separate side channel.
+
 See [`directory-api/README.md`](directory-api/README.md) for the actual layout and first-time
 setup steps.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Client Management — fleet overview](screenshots/RDS_Image1.png) | ![Client detail — hardware, session history](screenshots/RDS_ClientDetail.png) |
+| ![Server Health — storage, hardware sensors, dual UPS](screenshots/RDS_Image2.png) | ![Activity log — connection and presence events](screenshots/RDS_Activity.png) |
+| ![Client Managers and blocked/revoked clients](screenshots/RDS_Image3.png) | ![Manager detail — access history](screenshots/RDS_ManagerDetail.png) |
+| ![Outbound mail configuration](screenshots/RDS_Email.png) | |
 
 # RustDesk Server Program
 
