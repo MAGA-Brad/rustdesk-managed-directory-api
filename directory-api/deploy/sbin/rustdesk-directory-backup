@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+BASE="/opt/rustdesk-directory"
+DEST="/var/backups/rustdesk-directory"
+LOG="/var/log/rustdesk-directory-backup.log"
+DB_CONTAINER="rustdesk-directory-db"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+TARGET="$DEST/daily-$STAMP"
+LOCK="/run/lock/rustdesk-directory-backup.lock"
+
+mkdir -p "$DEST" "$(dirname "$LOCK")"
+exec 9>"$LOCK"
+
+if ! flock -n 9; then
+    exit 0
+fi
+
+# Best-effort report to the same health-event endpoint/secret the RDS
+# health-watcher already uses - reuses its existing debounce+notification
+# path (push + email) rather than inventing a second one. Must never affect
+# the backup itself, hence the trailing `|| true` and the early `return 0`s.
+report_health_event() {
+    local condition_key="$1" is_active="$2" detail="$3"
+    local secret
+    secret="$(cat /etc/rustdesk-health-watcher/secret 2>/dev/null)" || return 0
+    [[ -n "$secret" ]] || return 0
+    local escaped_detail
+    escaped_detail="$(printf '%s' "$detail" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    curl -fsS -m 15 -X POST \
+        "https://ops.example.com/ops/api/mobile/internal/health-event" \
+        -H "Content-Type: application/json" \
+        -H "X-Health-Watcher-Secret: $secret" \
+        -A "rustdesk-directory-backup/1.0" \
+        -d "{\"condition_key\":\"$condition_key\",\"is_active\":$is_active,\"detail\":\"$escaped_detail\"}" \
+        >/dev/null 2>&1 || true
+}
+
+cleanup() {
+    exit_code=$?
+    if [[ "$exit_code" -ne 0 ]]; then
+        rm -rf "$TARGET"
+        printf '%s BACKUP_FAILED exit=%s\n' \
+            "$(date -u +%FT%TZ)" "$exit_code" >> "$LOG"
+        report_health_event "backup_daily" "true" \
+            "Backup failed with exit code $exit_code"
+    else
+        report_health_event "backup_daily" "false" \
+            "Backup completed: $TARGET"
+    fi
+    exit "$exit_code"
+}
+trap cleanup EXIT
+
+mkdir -p "$TARGET"
+
+docker exec "$DB_CONTAINER" pg_dump \
+    -U rustdesk_directory \
+    -d rustdesk_directory \
+    -Fc > "$TARGET/database.dump"
+
+tables=(
+    directory_instance
+    operator_accounts
+    operator_sessions
+    managed_devices
+    device_credentials
+    audit_events
+    relay_access_leases
+    device_reenrollment_authorizations
+)
+
+: > "$TARGET/DB-COUNTS.tsv"
+for table in "${tables[@]}"; do
+    count="$(
+        docker exec "$DB_CONTAINER" psql -X -Atq \
+            -U rustdesk_directory \
+            -d rustdesk_directory \
+            -c "SELECT COUNT(*) FROM ${table};"
+    )"
+    printf '%s|%s\n' "$table" "$count" >> "$TARGET/DB-COUNTS.tsv"
+done
+
+paths=(
+    "opt/rustdesk-directory/app"
+    "opt/rustdesk-directory/compose.yml"
+    "opt/rustdesk-directory/config/secrets.env"
+)
+
+[[ -f /opt/rustdesk-directory/compose.override.yml ]] \
+    && paths+=("opt/rustdesk-directory/compose.override.yml")
+[[ -f /etc/caddy/Caddyfile ]] \
+    && paths+=("etc/caddy/Caddyfile")
+[[ -d /var/lib/rustdesk-server ]] \
+    && paths+=("var/lib/rustdesk-server")
+[[ -f /opt/rustdesk-oss/compose.yml ]] \
+    && paths+=("opt/rustdesk-oss/compose.yml")
+[[ -d /opt/rustdesk-oss/data ]] \
+    && paths+=("opt/rustdesk-oss/data")
+[[ -f /opt/rustdesk-oss/PINNED_IMAGE.txt ]] \
+    && paths+=("opt/rustdesk-oss/PINNED_IMAGE.txt")
+[[ -f /usr/local/sbin/rustdesk-relay-guard-sync ]] \
+    && paths+=("usr/local/sbin/rustdesk-relay-guard-sync")
+[[ -f /usr/local/sbin/rustdesk-relay-guard ]] \
+    && paths+=("usr/local/sbin/rustdesk-relay-guard")
+[[ -f /etc/systemd/system/rustdesk-relay-guard.service ]] \
+    && paths+=("etc/systemd/system/rustdesk-relay-guard.service")
+
+tar -C / -czf "$TARGET/source-and-config.tar.gz" \
+    "${paths[@]}"
+
+sha256sum \
+    "$TARGET/database.dump" \
+    "$TARGET/source-and-config.tar.gz" \
+    "$TARGET/DB-COUNTS.tsv" \
+    > "$TARGET/SHA256SUMS"
+
+cat > "$TARGET/RESTORE-NOTES.txt" <<'NOTES'
+This backup contains:
+- PostgreSQL custom-format dump: database.dump
+- Database row-count manifest: DB-COUNTS.tsv
+- RustDesk Directory application/configuration archive
+- Caddyfile when present
+- RustDesk OSS compose/image pin and server key/state data when present
+- Relay-guard files when present
+
+The automated restore verifier restores database.dump into an isolated
+temporary PostgreSQL container and validates important table row counts.
+
+The secrets archive is sensitive and is stored with root-only permissions.
+NOTES
+
+chmod -R go-rwx "$TARGET"
+
+find "$DEST" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -type d \
+    -name 'daily-*' \
+    -mtime +13 \
+    -exec rm -rf -- {} +
+
+printf '%s BACKUP_OK path=%s\n' \
+    "$(date -u +%FT%TZ)" "$TARGET" >> "$LOG"
+
+trap - EXIT
