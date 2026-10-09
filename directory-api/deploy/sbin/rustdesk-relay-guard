@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+DB_CONTAINER="rustdesk-directory-db"
+usage(){ echo "Usage: rustdesk-relay-guard status | staged | enforced" >&2; exit 2; }
+[[ $# -eq 1 ]] || usage
+case "$1" in
+  status)
+    docker exec "$DB_CONTAINER" psql -X -Atq -U rustdesk_directory -d rustdesk_directory -c "SELECT 'mode='||setting_value FROM security_settings WHERE setting_key='relay_guard_mode'; SELECT 'active_leases='||COUNT(*) FROM relay_access_leases WHERE revoked_at IS NULL AND expires_at>now();"
+    nft list table inet rustdesk_guard 2>/dev/null || true
+    systemctl --no-pager --full status rustdesk-relay-guard.service || true
+    ;;
+  staged|enforced)
+    mode="$1"
+    docker exec "$DB_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U rustdesk_directory -d rustdesk_directory -c "INSERT INTO security_settings(setting_key,setting_value,updated_at) VALUES ('relay_guard_mode','$mode',now()) ON CONFLICT (setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=EXCLUDED.updated_at;"
+    echo "Relay guard requested mode: $mode"
+    echo "The synchronizer will apply it within a few seconds."
+    ;;
+  *) usage ;;
+esac

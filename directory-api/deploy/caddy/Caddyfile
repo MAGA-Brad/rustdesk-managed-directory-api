@@ -1,0 +1,234 @@
+{
+	servers :443 {
+		listener_wrappers {
+			proxy_protocol {
+				timeout 2s
+				# Address of the upstream HAProxy that sends PROXY protocol headers.
+				allow 192.0.2.3/32
+			}
+			tls
+		}
+		# Without this, a request that TLS-handshakes with one SNI (e.g.
+		# filedrop.example.com, deliberately outside HAProxy's
+		# SNI allowlist) but sends a different Host header
+		# (e.g. ops.example.com) gets routed by Caddy to that OTHER
+		# hostname's site block anyway - Caddy picks the site purely by the
+		# decrypted Host header, never cross-checking it against the SNI
+		# used for the handshake. That would let a request reach the admin login UI or
+		# the managed-client API while bypassing the CDN's WAF and the edge
+		# proxy's source-IP restriction. This closes it for every hostname,
+		# present or future.
+		strict_sni_host
+		# Requests proxied by Cloudflare carry the real client in CF-Connecting-IP; trust it
+		# only from Cloudflare's published ranges (re-check https://www.cloudflare.com/ips).
+		trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+		client_ip_headers CF-Connecting-IP
+	}
+}
+
+rd.example.com {
+	encode gzip
+
+	@private_docs path /docs* /redoc* /openapi.json
+	respond @private_docs 404
+
+	@management path /ops /ops/*
+	respond @management 404
+
+	@recovery path /v1/operator-access-resets/setup /v1/operator-access-resets/accept
+	respond @recovery 404
+
+	# Explicit managed-client API allowlist for rd.example.com.
+	@managed_client_api path /v1/device/relay-lease
+	handle @managed_client_api {
+		reverse_proxy 127.0.0.1:21120 {
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	# Native RustDesk protocol over WebSocket, for clients on networks that
+	# block the raw TCP/UDP ports (21115/21116/21117) but allow standard
+	# HTTPS out (e.g. restrictive mobile hotspots). Path convention is
+	# fixed by the client's own hbb_common/websocket.rs check_ws() - do not
+	# change these paths without also changing the client. hbbs's websocket
+	# listener is 21118 (id/rendezvous), hbbr's is 21119 (relay); both run
+	# in network_mode: host so localhost reaches them directly.
+	@rustdesk_ws_id path /ws/id
+	handle @rustdesk_ws_id {
+		reverse_proxy 127.0.0.1:21118 {
+			header_up X-Real-IP {client_ip}
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	@rustdesk_ws_relay path /ws/relay
+	handle @rustdesk_ws_relay {
+		reverse_proxy 127.0.0.1:21119 {
+			header_up X-Real-IP {client_ip}
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+ops.example.com {
+	tls /etc/caddy/origin/ops-client-origin.pem /etc/caddy/origin/ops-client-origin.key {
+		client_auth {
+			mode require_and_verify
+			trust_pool file /etc/caddy/origin/aop-ca.pem
+		}
+	}
+	encode gzip
+
+	@private_docs path /docs* /redoc* /openapi.json
+	respond @private_docs 404
+
+	# Management UI only. Managed-client API traffic belongs on client.example.com.
+	@managed_client_api path /v1/enrollment/devices /v1/enrollment/status /v1/device/me /v1/device/heartbeat /v1/device/contact-email /v1/directory /v1/device/relay-lease /v1/device/session-heartbeat /v1/device/connection-event /v1/updates/latest /v1/updates/releases/*
+	respond @managed_client_api 404
+
+	@ops path /ops /ops/*
+	handle @ops {
+		reverse_proxy 127.0.0.1:21120 {
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	@recovery path /v1/operator-access-resets/setup /v1/operator-access-resets/accept
+	handle @recovery {
+		reverse_proxy 127.0.0.1:21120 {
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+client.example.com {
+	tls /etc/caddy/origin/ops-client-origin.pem /etc/caddy/origin/ops-client-origin.key {
+		client_auth {
+			mode require_and_verify
+			trust_pool file /etc/caddy/origin/aop-ca.pem
+		}
+	}
+	encode gzip
+
+	@private_docs path /docs* /redoc* /openapi.json
+	respond @private_docs 404
+
+	@management path /ops /ops/*
+	respond @management 404
+
+	@recovery path /v1/operator-access-resets/setup /v1/operator-access-resets/accept
+	respond @recovery 404
+
+	# Managed-client API only.
+	@managed_client_api path /v1/enrollment/devices /v1/enrollment/status /v1/enrollment/reenrollment-request /v1/enrollment/reenroll /v1/device/me /v1/device/heartbeat /v1/device/contact-email /v1/directory /v1/device/relay-lease /v1/device/session-heartbeat /v1/device/connection-event /v1/updates/latest /v1/updates/releases/* /v1/messaging/* /v1/device/log-upload /v1/filedrop/* /v1/device/peer-cert /v1/peer-auth/ca /v1/device/edge-cert /v1/sealed /v1/device/wait
+	handle @managed_client_api {
+		reverse_proxy 127.0.0.1:21120 {
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+filedrop.example.com {
+	encode gzip
+
+	# Deliberately unproxied (DNS-only) hostname - exists solely so large RustDrop
+	# uploads/downloads can bypass Cloudflare's proxy body-size cap. Scope is kept
+	# to just the filedrop blob path; everything else stays on client.example.com.
+	# The edge HAProxy only forwards this SNI to the rustdesk backend, no Cloudflare-
+	# source restriction (see the edge proxy configuration).
+	@filedrop_api path /v1/filedrop/*
+	handle @filedrop_api {
+		reverse_proxy 127.0.0.1:21120 {
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+# Native RustDesk protocol over WebSocket through Cloudflare: the managed clients' fallback (build 32)
+# for networks that block the raw ports and our WAN address but let Cloudflare through. Only
+# Cloudflare can connect (HAProxy SNI allowlist + origin-pull client cert). hbbs/hbbr take the client
+# IP from X-Real-IP, set here from CF-Connecting-IP (trusted only from Cloudflare's ranges).
+ws.example.com {
+	tls /etc/caddy/origin/ws-origin.pem /etc/caddy/origin/ws-origin.key {
+		client_auth {
+			mode require_and_verify
+			trust_pool file /etc/caddy/origin/aop-ca.pem
+		}
+	}
+
+	@rustdesk_ws_id path /ws/id
+	handle @rustdesk_ws_id {
+		reverse_proxy 127.0.0.1:21118 {
+			header_up X-Real-IP {client_ip}
+			header_up X-Forwarded-For {client_ip}
+			stream_close_delay 2h
+		}
+	}
+
+	@rustdesk_ws_relay path /ws/relay
+	handle @rustdesk_ws_relay {
+		reverse_proxy 127.0.0.1:21119 {
+			header_up X-Real-IP {client_ip}
+			header_up X-Forwarded-For {client_ip}
+			stream_close_delay 2h
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}

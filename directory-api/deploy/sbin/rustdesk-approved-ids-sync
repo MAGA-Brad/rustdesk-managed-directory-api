@@ -1,0 +1,82 @@
+#!/bin/bash
+# Writes the RustDesk ids of RDS-approved devices into the relay's data dir for hbbs's
+# approved-device gate (custom hbbs build). Keeps the previous list if the query fails or returns nothing.
+set -euo pipefail
+dir=/opt/rustdesk-oss/data
+
+# Rendezvous encryption: hbbs's key exchange mode from RDS (Config -> Remote Connections) into hbbs's
+# rendezvous_settings (hbbs re-reads it every 15 s), and hbbs's latest 5-minute counts
+# (rendezvous_stats) back into RDS. Failures here never stop the approved-ids sync below.
+rdsql() { docker exec -i rustdesk-directory-db psql -U rustdesk_directory -d rustdesk_directory -At "$@"; }
+# A failed query prints "!" so it is never mistaken for a missing setting: then hbbs keeps its
+# current settings rather than falling back (managed clients from build 30 can't connect while the
+# key exchange is off). A setting that is genuinely missing means optional.
+setting() { rdsql -c "SELECT btrim(setting_value::text, '\"') FROM directory_settings WHERE setting_key = '$1'" 2>/dev/null || echo '!'; }
+mode=$(setting relay.rendezvous_encryption)
+webrtc=$(setting relay.webrtc)
+test_ids=$(setting relay.webrtc_test_ids)
+# Device passports: hbbs's passport check (off/log/test/enforce), its test ids and the grace period.
+passport=$(setting relay.passport_check)
+passport_ids=$(setting relay.passport_test_ids)
+grace=$(setting sec8.passport_grace_days)
+unreadable=0
+for value in "$mode" "$webrtc" "$test_ids" "$passport" "$passport_ids" "$grace"; do if [ "$value" = '!' ]; then unreadable=1; fi; done
+case "$mode" in off|optional|required) ;; *) mode=optional ;; esac
+case "$webrtc" in off|test|on) ;; *) webrtc=off ;; esac
+case "$passport" in off|log|test|enforce) ;; *) passport=off ;; esac
+[[ "$grace" =~ ^[0-9]{1,2}$ ]] || grace=7
+test_ids=$(printf '%s' "$test_ids" | tr -cd 'A-Za-z0-9_,-')
+passport_ids=$(printf '%s' "$passport_ids" | tr -cd 'A-Za-z0-9_,-')
+want=$(printf 'rendezvous-encryption=%s\nwebrtc=%s\nwebrtc-test-ids=%s\npassport=%s\npassport-test-ids=%s\npassport-grace-days=%s' \
+  "$mode" "$webrtc" "$test_ids" "$passport" "$passport_ids" "$grace")
+if [ "$unreadable" = 1 ]; then
+  echo "hbbs settings: RDS settings unreadable, keeping the current ones"
+elif [ "$(cat "$dir/rendezvous_settings" 2>/dev/null || true)" != "$want" ]; then
+  printf '%s\n' "$want" > "$dir/.rendezvous_settings.tmp" \
+    && chmod 0644 "$dir/.rendezvous_settings.tmp" \
+    && mv -f "$dir/.rendezvous_settings.tmp" "$dir/rendezvous_settings" \
+    && echo "hbbs settings: rendezvous-encryption=$mode webrtc=$webrtc test ids=[$test_ids] passport=$passport test ids=[$passport_ids] grace=${grace}d" || true
+fi
+pstats=$(head -c 2048 "$dir/passport_stats" 2>/dev/null || true)
+# Nested JSON of hbbs's fixed names and reasons (letters, digits, spaces); the database checks it parses.
+if [[ "$pstats" =~ ^\{[\"A-Za-z_:0-9,{}\ -]+\}$ ]]; then
+  printf "INSERT INTO directory_settings (setting_key, setting_value) VALUES ('relay.passport_stats', :'stats'::jsonb) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value WHERE directory_settings.setting_value IS DISTINCT FROM EXCLUDED.setting_value;\n" \
+    | rdsql -v stats="$pstats" >/dev/null 2>&1 || true
+fi
+# sec8 two-box list: each approved device's identity-key fingerprint (SHA-256 of the raw key, first
+# 16 bytes, hex), so hbbs accepts a passport only for the key RDS has on file. Kept on failure.
+keys_tmp=$(mktemp "$dir/.approved_keys.XXXXXX")
+if docker exec rustdesk-directory-db psql -U rustdesk_directory -d rustdesk_directory -At -F ' ' -c "
+    SELECT rustdesk_id, encode(substring(sha256(decode(
+             rpad(translate(identity_public_key, '-_', '+/'), ((length(identity_public_key) + 3) / 4) * 4, '='),
+             'base64')) from 1 for 16), 'hex')
+    FROM managed_devices
+    WHERE status = 'approved' AND COALESCE(rustdesk_id, '') <> '' AND COALESCE(identity_public_key, '') <> ''
+    ORDER BY 1" > "$keys_tmp" 2>/dev/null; then
+  if ! cmp -s "$keys_tmp" "$dir/approved_keys"; then
+    chmod 0644 "$keys_tmp" && mv -f "$keys_tmp" "$dir/approved_keys" && echo "approved keys: $(wc -l < "$dir/approved_keys") devices"
+  else
+    touch "$dir/approved_keys"
+  fi
+else
+  echo "approved keys: query failed, keeping the previous list" >&2
+fi
+rm -f "$keys_tmp"
+stats=$(head -c 512 "$dir/rendezvous_stats" 2>/dev/null || true)
+# Only a flat JSON object of lowercase names, digits and quotes reaches the database.
+if [[ "$stats" =~ ^\{[\"a-z_:0-9,]+\}$ ]]; then
+  printf "INSERT INTO directory_settings (setting_key, setting_value) VALUES ('relay.rendezvous_encryption_stats', :'stats'::jsonb) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value WHERE directory_settings.setting_value IS DISTINCT FROM EXCLUDED.setting_value;\n" \
+    | rdsql -v stats="$stats" >/dev/null 2>&1 || true
+fi
+
+tmp=$(mktemp "$dir/.approved_ids.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+docker exec rustdesk-directory-db psql -U rustdesk_directory -d rustdesk_directory -At \
+  -c "SELECT rustdesk_id FROM managed_devices WHERE status = 'approved' AND COALESCE(rustdesk_id, '') <> '' ORDER BY 1" > "$tmp"
+if [ ! -s "$tmp" ]; then
+  echo "approved-ids-sync: query returned no ids; keeping the previous list" >&2
+  exit 1
+fi
+chmod 0644 "$tmp"
+mv -f "$tmp" "$dir/approved_ids"
+trap - EXIT

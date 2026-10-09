@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+DB_CONTAINER="rustdesk-directory-db"
+SECRETS_FILE="/opt/rustdesk-directory/config/secrets.env"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "ERROR: this first-Owner bootstrap command must be run as root." >&2
+    exit 1
+fi
+
+if [[ ! -f "$SECRETS_FILE" ]]; then
+    echo "ERROR: Directory secrets file is missing." >&2
+    exit 1
+fi
+
+# Only a brand-new directory can be bootstrapped: no Owner yet and the
+# one-time Creator-Owner bootstrap (migration 013) not completed. Every later
+# Owner is promoted through the normal Owner role-change workflow, which the
+# database itself enforces.
+if ! bootstrap_state="$(
+    docker exec "$DB_CONTAINER" psql -X -Atq -F '|' \
+        -U rustdesk_directory -d rustdesk_directory \
+        -c "SELECT (SELECT COUNT(*) FROM operator_accounts WHERE role='owner'), (SELECT bootstrap_completed_at IS NOT NULL FROM directory_instance WHERE singleton = TRUE);"
+)"; then
+    echo "ERROR: could not read the directory database. Apply migrations/*.sql first." >&2
+    exit 1
+fi
+IFS='|' read -r OWNER_COUNT BOOTSTRAPPED <<< "$bootstrap_state"
+
+if [[ -z "$BOOTSTRAPPED" ]]; then
+    echo "ERROR: directory_instance has no row. Apply migrations/*.sql first." >&2
+    exit 1
+fi
+
+if [[ "$OWNER_COUNT" != "0" || "$BOOTSTRAPPED" != "f" ]]; then
+    echo "ERROR: this directory has already been bootstrapped with an Owner account." >&2
+    echo "Use rustdesk-owner-emergency-recovery or Owner-to-Owner access recovery instead." >&2
+    exit 1
+fi
+
+echo
+echo "RustDesk Directory FIRST-OWNER BOOTSTRAP"
+echo "----------------------------------------"
+echo "This local root-only command creates the one Creator-Owner account."
+echo "Additional operators are invited from the admin dashboard afterwards."
+echo
+
+while true; do
+    read -r -p "Owner username: " OWNER_USERNAME
+    if [[ -z "${OWNER_USERNAME// }" || ${#OWNER_USERNAME} -gt 64 ]]; then
+        echo "Username must be 1-64 characters."
+        continue
+    fi
+    break
+done
+
+read -r -p "Owner display name [${OWNER_USERNAME}]: " OWNER_DISPLAY
+OWNER_DISPLAY="${OWNER_DISPLAY:-$OWNER_USERNAME}"
+if [[ -z "${OWNER_DISPLAY// }" || ${#OWNER_DISPLAY} -gt 128 ]]; then
+    echo "ERROR: display name must be 1-128 characters." >&2
+    exit 1
+fi
+
+while true; do
+    read -r -s -p "Enter the new Owner password: " OWNER_PASSWORD
+    echo
+    read -r -s -p "Enter it again: " OWNER_PASSWORD_CONFIRM
+    echo
+
+    if [[ "$OWNER_PASSWORD" != "$OWNER_PASSWORD_CONFIRM" ]]; then
+        echo "Passwords did not match. Try again."
+        continue
+    fi
+
+    if (( ${#OWNER_PASSWORD} < 12 )); then
+        echo "Password must contain at least 12 characters."
+        continue
+    fi
+
+    break
+done
+unset OWNER_PASSWORD_CONFIRM
+
+TOTP_ENCRYPTION_SECRET="$(
+    sed -n 's/^TOTP_ENCRYPTION_SECRET=//p' "$SECRETS_FILE" |
+        tail -n 1
+)"
+if [[ -z "$TOTP_ENCRYPTION_SECRET" ]]; then
+    echo "ERROR: TOTP_ENCRYPTION_SECRET is missing." >&2
+    exit 1
+fi
+
+TOTP_SECRET="$(
+    openssl rand 20 |
+        base32 |
+        tr -d '=\n' |
+        tr '[:lower:]' '[:upper:]'
+)"
+
+TOTP_URI="$(
+    python3 - "$OWNER_USERNAME" "$TOTP_SECRET" <<'PY'
+import sys
+from urllib.parse import quote
+
+username = sys.argv[1]
+secret = sys.argv[2]
+issuer = "RustDesk Directory"
+label = f"{issuer}:{username}"
+print(
+    "otpauth://totp/"
+    + quote(label, safe="")
+    + "?secret="
+    + quote(secret, safe="")
+    + "&issuer="
+    + quote(issuer, safe="")
+    + "&algorithm=SHA1&digits=6&period=30"
+)
+PY
+)"
+
+echo
+echo "Add a RustDesk Directory entry to your authenticator."
+echo
+echo "Account: RustDesk Directory ($OWNER_USERNAME)"
+echo "Secret:  $TOTP_SECRET"
+echo
+echo "Manual setup URI:"
+echo "$TOTP_URI"
+echo
+
+while true; do
+    read -r -p "Enter the current 6-digit code from the NEW authenticator entry: " TOTP_CODE
+
+    if python3 - "$TOTP_SECRET" "$TOTP_CODE" <<'PY'
+import base64
+import hashlib
+import hmac
+import struct
+import sys
+import time
+
+secret_text = sys.argv[1].strip().upper()
+code = sys.argv[2].strip()
+if len(code) != 6 or not code.isdigit():
+    raise SystemExit(1)
+
+padding = "=" * ((8 - len(secret_text) % 8) % 8)
+secret = base64.b32decode(secret_text + padding, casefold=True)
+
+for offset in (-1, 0, 1):
+    counter = int(time.time()) // 30 + offset
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(secret, msg, hashlib.sha1).digest()
+    index = digest[-1] & 0x0F
+    value = (
+        ((digest[index] & 0x7F) << 24)
+        | ((digest[index + 1] & 0xFF) << 16)
+        | ((digest[index + 2] & 0xFF) << 8)
+        | (digest[index + 3] & 0xFF)
+    ) % 1_000_000
+    if hmac.compare_digest(f"{value:06d}", code):
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+    then
+        break
+    fi
+
+    echo "That code did not verify. Try again."
+done
+
+sql_escape() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
+
+P_SQL="$(sql_escape "$OWNER_PASSWORD")"
+TOTP_SQL="$(sql_escape "$TOTP_SECRET")"
+KEY_SQL="$(sql_escape "$TOTP_ENCRYPTION_SECRET")"
+USER_SQL="$(sql_escape "$OWNER_USERNAME")"
+DISPLAY_SQL="$(sql_escape "$OWNER_DISPLAY")"
+
+unset OWNER_PASSWORD
+unset TOTP_ENCRYPTION_SECRET
+
+# The Creator-Owner row must arrive with its own password and confirmed TOTP
+# already set (guard_direct_operator_role_mutation); the AFTER INSERT trigger
+# complete_creator_owner_bootstrap then records it in directory_instance,
+# which closes this path for good.
+cat <<SQL | docker exec -i "$DB_CONTAINER" psql -X -v ON_ERROR_STOP=1 \
+    -U rustdesk_directory -d rustdesk_directory >/dev/null
+BEGIN;
+
+WITH creator_owner AS (
+    INSERT INTO operator_accounts (
+        username,
+        display_name,
+        password_hash,
+        totp_secret_ciphertext,
+        totp_enabled,
+        totp_confirmed_at,
+        role,
+        is_active,
+        must_change_password,
+        password_changed_at
+    )
+    VALUES (
+        '$USER_SQL',
+        '$DISPLAY_SQL',
+        crypt('$P_SQL', gen_salt('bf', 12)),
+        pgp_sym_encrypt('$TOTP_SQL', '$KEY_SQL'),
+        TRUE,
+        NOW(),
+        'owner',
+        TRUE,
+        FALSE,
+        NOW()
+    )
+    RETURNING id
+)
+INSERT INTO audit_events (
+    actor_account_id,
+    event_type,
+    target_type,
+    target_id,
+    source_ip,
+    details
+)
+SELECT
+    NULL,
+    'operator.owner_bootstrap',
+    'operator_account',
+    creator_owner.id,
+    NULL,
+    jsonb_build_object(
+        'username', '$USER_SQL',
+        'method', 'local_root_cli'
+    )
+FROM creator_owner;
+
+COMMIT;
+SQL
+
+# The account already exists at this point, so a failed read only loses the
+# printout; the README shows the same query.
+OWNER_ID="$(
+    docker exec "$DB_CONTAINER" psql -X -Atq \
+        -U rustdesk_directory -d rustdesk_directory \
+        -c "SELECT creator_owner_id FROM directory_instance WHERE singleton = TRUE;"
+)" || OWNER_ID="(could not read; see README First-time setup)"
+
+echo
+echo "FIRST_OWNER_BOOTSTRAP_COMPLETE"
+echo "Owner:    $OWNER_USERNAME"
+echo "Owner id: $OWNER_ID"
+echo "Sign in to /ops with this password and the authenticator entry."
+echo
+echo "Next: set PROTECTED_BRAD_ACCOUNT_ID in app/main.py (and the all-zero UUIDs in"
+echo "migration 023) to this id, and make sure the protected username matches this"
+echo "Owner (default 'brad'). See First-time setup step 3 in README.md."

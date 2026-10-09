@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync RDS-approved device ids for the relay's approved-device gate
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rustdesk-approved-ids-sync

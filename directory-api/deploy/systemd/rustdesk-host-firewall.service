@@ -1,0 +1,13 @@
+[Unit]
+Description=RustDesk host SSH firewall
+After=netfilter-persistent.service
+Before=docker.service rustdesk-relay-guard.service
+Wants=netfilter-persistent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rustdesk-host-firewall
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
