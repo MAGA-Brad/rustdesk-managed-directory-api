@@ -1,0 +1,16 @@
+# Managed by RustDesk Directory administration installer
+services:
+  database:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+  api:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    volumes:
+      - /var/lib/rustdesk-directory-ops:/run/rustdesk-ops:ro

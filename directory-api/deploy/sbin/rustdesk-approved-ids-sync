@@ -1,0 +1,118 @@
+#!/bin/bash
+# Writes the RustDesk ids of RDS-approved devices into the relay's data dir for hbbs's
+# approved-device gate (custom hbbs build). Keeps the previous list if the query fails or returns nothing.
+set -euo pipefail
+# hbbs reads the gate lists (approved_ids, approved_keys) from gate_dir, and rendezvous_settings
+# from its working dir hbbs_dir, where it also writes its stats. Set both to your relay's data
+# dir (they may be the same directory).
+gate_dir=/opt/rustdesk-oss/data
+hbbs_dir=/opt/rustdesk-oss/data
+
+# The relay's own processes may be able to write those dirs, so this root script never opens,
+# chmods or touches a name there that could have been replaced with a symlink, FIFO or directory.
+# Each file is built under a random name in a root-only staging dir on the same mount and renamed
+# into place:
+# rename(2) replaces whatever sits at the name (a planted symlink included) instead of following
+# it, and mv -T refuses a planted directory. hbbs's own files are only read when they are plain
+# files, a few KiB at most, with a time limit.
+# Same mount, not just the same device number: a bind mount keeps the device number, but rename(2)
+# across mount points fails with EXDEV and mv then quietly copies instead (not atomic). Checked
+# with findmnt rather than mv --no-copy, which older coreutils lack.
+stage=/opt/rustdesk-oss/sync-staging
+install -d -m 0700 "$stage"
+stage_mount=$(findmnt -n -o TARGET -T "$stage" || true)
+for target in "$gate_dir" "$hbbs_dir"; do
+  if [ -z "$stage_mount" ] || [ "$(findmnt -n -o TARGET -T "$target" || true)" != "$stage_mount" ]; then
+    echo "approved-ids-sync: $stage and $target are not on the same mount; not syncing" >&2
+    exit 1
+  fi
+done
+find "$stage" -maxdepth 1 -type f -mmin +10 -delete 2>/dev/null || true
+settings_tmp=$(mktemp "$stage/rendezvous_settings.XXXXXX")
+keys_tmp=$(mktemp "$stage/approved_keys.XXXXXX")
+ids_tmp=$(mktemp "$stage/approved_ids.XXXXXX")
+trap 'rm -f -- "$settings_tmp" "$keys_tmp" "$ids_tmp"' EXIT
+# Moves a finished staging file ($1) over the path $2.
+publish() { chmod 0644 "$1" && mv -fT -- "$1" "$2"; }
+# At most $2 bytes of a file hbbs writes; nothing if it is not a plain file.
+read_small() { if [ -f "$1" ] && [ ! -L "$1" ]; then timeout 5 head -c "$2" -- "$1" 2>/dev/null || true; fi; }
+
+# Rendezvous encryption: hbbs's key exchange mode from RDS (Config -> Remote Connections) into hbbs's
+# rendezvous_settings (hbbs re-reads it every 15 s), and hbbs's latest 5-minute counts
+# (rendezvous_stats) back into RDS. Failures here never stop the approved-ids sync below.
+rdsql() { docker exec -i rustdesk-directory-db psql -U rustdesk_directory -d rustdesk_directory -At "$@"; }
+# A failed query prints "!" so it is never mistaken for a missing setting: then hbbs keeps its
+# current settings rather than falling back (managed clients from build 30 can't connect while the
+# key exchange is off). A setting that is genuinely missing means optional.
+setting() { rdsql -c "SELECT btrim(setting_value::text, '\"') FROM directory_settings WHERE setting_key = '$1'" 2>/dev/null || echo '!'; }
+mode=$(setting relay.rendezvous_encryption)
+webrtc=$(setting relay.webrtc)
+test_ids=$(setting relay.webrtc_test_ids)
+# Device passports: hbbs's passport check (off/log/test/enforce), its test ids and the grace period.
+passport=$(setting relay.passport_check)
+passport_ids=$(setting relay.passport_test_ids)
+grace=$(setting sec8.passport_grace_days)
+unreadable=0
+for value in "$mode" "$webrtc" "$test_ids" "$passport" "$passport_ids" "$grace"; do if [ "$value" = '!' ]; then unreadable=1; fi; done
+case "$mode" in off|optional|required) ;; *) mode=optional ;; esac
+case "$webrtc" in off|test|on) ;; *) webrtc=off ;; esac
+case "$passport" in off|log|test|enforce) ;; *) passport=off ;; esac
+[[ "$grace" =~ ^[0-9]{1,2}$ ]] || grace=7
+test_ids=$(printf '%s' "$test_ids" | tr -cd 'A-Za-z0-9_,-')
+passport_ids=$(printf '%s' "$passport_ids" | tr -cd 'A-Za-z0-9_,-')
+want=$(printf 'rendezvous-encryption=%s\nwebrtc=%s\nwebrtc-test-ids=%s\npassport=%s\npassport-test-ids=%s\npassport-grace-days=%s' \
+  "$mode" "$webrtc" "$test_ids" "$passport" "$passport_ids" "$grace")
+if [ "$unreadable" = 1 ]; then
+  echo "hbbs settings: RDS settings unreadable, keeping the current ones"
+elif [ "$(read_small "$hbbs_dir/rendezvous_settings" 4096)" != "$want" ]; then
+  printf '%s\n' "$want" > "$settings_tmp" \
+    && publish "$settings_tmp" "$hbbs_dir/rendezvous_settings" \
+    && echo "hbbs settings: rendezvous-encryption=$mode webrtc=$webrtc test ids=[$test_ids] passport=$passport test ids=[$passport_ids] grace=${grace}d" || true
+fi
+pstats=$(read_small "$hbbs_dir/passport_stats" 2048)
+# Nested JSON of hbbs's fixed names and reasons (letters, digits, spaces); the database checks it parses.
+if [[ "$pstats" =~ ^\{[\"A-Za-z_:0-9,{}\ -]+\}$ ]]; then
+  printf "INSERT INTO directory_settings (setting_key, setting_value) VALUES ('relay.passport_stats', :'stats'::jsonb) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value WHERE directory_settings.setting_value IS DISTINCT FROM EXCLUDED.setting_value;\n" \
+    | rdsql -v stats="$pstats" >/dev/null 2>&1 || true
+fi
+# Only well-formed RustDesk ids reach hbbs's line-based lists below (a newline in an id would make
+# a line of its own); approved devices with any other id are counted, not listed.
+id_ok="rustdesk_id ~ '^[A-Za-z0-9_-]{6,32}\$'"
+# sec8 two-box list: each approved device's identity-key fingerprint (SHA-256 of the raw key, first
+# 16 bytes, hex), so hbbs accepts a passport only for the key RDS has on file. Kept on failure.
+if docker exec rustdesk-directory-db psql -U rustdesk_directory -d rustdesk_directory -At -F ' ' -c "
+    SELECT rustdesk_id, encode(substring(sha256(decode(
+             rpad(translate(identity_public_key, '-_', '+/'), ((length(identity_public_key) + 3) / 4) * 4, '='),
+             'base64')) from 1 for 16), 'hex')
+    FROM managed_devices
+    WHERE status = 'approved' AND COALESCE(rustdesk_id, '') <> '' AND $id_ok AND COALESCE(identity_public_key, '') <> ''
+    ORDER BY 1" > "$keys_tmp" 2>/dev/null; then
+  if [ -L "$gate_dir/approved_keys" ] || [ ! -f "$gate_dir/approved_keys" ] || ! timeout 5 cmp -s -- "$keys_tmp" "$gate_dir/approved_keys"; then
+    count=$(wc -l < "$keys_tmp")
+    publish "$keys_tmp" "$gate_dir/approved_keys" && echo "approved keys: $count devices"
+  else
+    # hbbs treats a list that stops updating as stale, so an unchanged one still gets a fresh time.
+    touch -c -h -- "$gate_dir/approved_keys"
+  fi
+else
+  echo "approved keys: query failed, keeping the previous list" >&2
+fi
+stats=$(read_small "$hbbs_dir/rendezvous_stats" 512)
+# Only a flat JSON object of lowercase names, digits and quotes reaches the database.
+if [[ "$stats" =~ ^\{[\"a-z_:0-9,]+\}$ ]]; then
+  printf "INSERT INTO directory_settings (setting_key, setting_value) VALUES ('relay.rendezvous_encryption_stats', :'stats'::jsonb) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value WHERE directory_settings.setting_value IS DISTINCT FROM EXCLUDED.setting_value;\n" \
+    | rdsql -v stats="$stats" >/dev/null 2>&1 || true
+fi
+
+bad_ids=$(docker exec rustdesk-directory-db psql -U rustdesk_directory -d rustdesk_directory -At \
+  -c "SELECT count(*) FROM managed_devices WHERE status = 'approved' AND COALESCE(rustdesk_id, '') <> '' AND NOT ($id_ok)" 2>/dev/null || true)
+if [ -n "$bad_ids" ] && [ "$bad_ids" != 0 ]; then
+  echo "approved-ids-sync: $bad_ids approved device(s) with a malformed RustDesk id left out of approved_ids and approved_keys" >&2
+fi
+docker exec rustdesk-directory-db psql -U rustdesk_directory -d rustdesk_directory -At \
+  -c "SELECT rustdesk_id FROM managed_devices WHERE status = 'approved' AND COALESCE(rustdesk_id, '') <> '' AND $id_ok ORDER BY 1" > "$ids_tmp"
+if [ ! -s "$ids_tmp" ]; then
+  echo "approved-ids-sync: query returned no ids; keeping the previous list" >&2
+  exit 1
+fi
+publish "$ids_tmp" "$gate_dir/approved_ids"

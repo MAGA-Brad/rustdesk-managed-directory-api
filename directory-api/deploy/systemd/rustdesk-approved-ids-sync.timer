@@ -1,0 +1,10 @@
+[Unit]
+Description=Sync RDS-approved device ids for the relay gate every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

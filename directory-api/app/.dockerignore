@@ -1,0 +1,15 @@
+# Keeps leftovers out of the image (COPY . . in the Dockerfile): edit backups, removed modules,
+# local tooling and caches.
+*.pre-*
+*.bak*
+*.removed-*
+*.orig
+*.rej
+*.swp
+*.log
+.env
+.venv
+.git
+__pycache__
+**/__pycache__
+*.pyc

@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+DB_CONTAINER="rustdesk-directory-db"
+# The running API holds the TOTP key the stack really uses (compose.yml passes it in from
+# /opt/rustdesk-directory/.env). config/secrets.env is not read by the stack and can be stale, so
+# this script never reads a key from a file: the checks and the write run inside the API container
+# (python3 -I, so nothing in /app is on the import path), which takes the key and the database
+# settings from its own environment. The new password, authenticator secret and reason go in on
+# stdin and into bound query parameters, never into SQL text or a command line.
+API_CONTAINER="rustdesk-directory-api"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "ERROR: this emergency recovery command must be run as root." >&2
+    exit 1
+fi
+
+if [[ "$(docker inspect -f '{{.State.Running}}' "$API_CONTAINER" 2>/dev/null || true)" != "true" ]]; then
+    echo "ERROR: $API_CONTAINER is not running; it holds the TOTP key this recovery must use." >&2
+    echo "Start the stack first: cd /opt/rustdesk-directory && docker compose up -d" >&2
+    exit 1
+fi
+
+owner_count="$(
+    docker exec "$DB_CONTAINER" psql -X -Atq \
+        -U rustdesk_directory -d rustdesk_directory \
+        -c "SELECT COUNT(*) FROM operator_accounts WHERE role='owner';"
+)"
+
+if [[ "$owner_count" != "1" ]]; then
+    echo "ERROR: emergency recovery is allowed only when exactly one Owner account exists." >&2
+    echo "Current Owner account count: $owner_count" >&2
+    echo "Use normal Owner-to-Owner access recovery when multiple Owners exist." >&2
+    exit 1
+fi
+
+owner_row="$(
+    docker exec "$DB_CONTAINER" psql -X -Atq -F '|' \
+        -U rustdesk_directory -d rustdesk_directory \
+        -c "SELECT id,username,display_name,is_active FROM operator_accounts WHERE role='owner' LIMIT 1;"
+)"
+IFS='|' read -r OWNER_ID OWNER_USERNAME OWNER_DISPLAY OWNER_ACTIVE <<< "$owner_row"
+
+# Whether the API's key opens the Owner's current authenticator secret (and the other accounts').
+# Prints "owner=ok|bad|none others=<opened>/<checked>".
+KEY_CHECK_PY="$(cat <<'PY'
+import os
+import sys
+
+import psycopg
+
+key = os.environ.get("TOTP_ENCRYPTION_SECRET", "")
+if not key:
+    sys.exit("TOTP_ENCRYPTION_SECRET is not set in the API container")
+owner_id = sys.argv[1]
+with psycopg.connect(
+    host=os.getenv("DATABASE_HOST", "database"),
+    port=int(os.getenv("DATABASE_PORT", "5432")),
+    dbname=os.getenv("DATABASE_NAME", "rustdesk_directory"),
+    user=os.getenv("DATABASE_USER", "rustdesk_directory"),
+    password=os.environ["DATABASE_PASSWORD"],
+    connect_timeout=5,
+    autocommit=True,
+) as connection:
+    with connection.cursor() as cursor:
+        def opens(account_id):
+            try:
+                cursor.execute(
+                    "SELECT pgp_sym_decrypt(totp_secret_ciphertext, %s) IS NOT NULL"
+                    " FROM operator_accounts WHERE id = %s",
+                    (key, account_id),
+                )
+                return True
+            except psycopg.Error:
+                return False
+
+        cursor.execute(
+            "SELECT totp_secret_ciphertext IS NOT NULL FROM operator_accounts WHERE id = %s",
+            (owner_id,),
+        )
+        row = cursor.fetchone()
+        owner = "none" if not row or not row[0] else ("ok" if opens(owner_id) else "bad")
+        cursor.execute(
+            "SELECT id FROM operator_accounts WHERE totp_secret_ciphertext IS NOT NULL AND id <> %s LIMIT 50",
+            (owner_id,),
+        )
+        others = [r[0] for r in cursor.fetchall()]
+        opened = sum(1 for account_id in others if opens(account_id))
+print(f"owner={owner} others={opened}/{len(others)}")
+PY
+)"
+
+key_check="$(docker exec "$API_CONTAINER" python3 -I -c "$KEY_CHECK_PY" "$OWNER_ID")" || {
+    echo "ERROR: could not check the API's TOTP key against the database." >&2
+    exit 1
+}
+
+echo
+echo "RustDesk Directory SOLE-OWNER EMERGENCY RECOVERY"
+echo "------------------------------------------------"
+echo "Owner: ${OWNER_DISPLAY:-$OWNER_USERNAME} ($OWNER_USERNAME)"
+echo
+case "$key_check" in
+    owner=ok\ *|owner=none\ *)
+        ;;
+    owner=bad\ *)
+        echo "WARNING: the running API's TOTP key does not open the Owner's current authenticator"
+        echo "secret (other accounts it opens: ${key_check##*others=}). An earlier recovery may have"
+        echo "written it with another key. The new secret is written with the API's key, which is"
+        echo "the one sign-in uses."
+        read -r -p "Type OVERWRITE to continue: " OVERWRITE
+        if [[ "$OVERWRITE" != "OVERWRITE" ]]; then
+            echo "Cancelled."
+            exit 1
+        fi
+        echo
+        ;;
+    *)
+        echo "ERROR: unexpected TOTP key check result." >&2
+        exit 1
+        ;;
+esac
+echo "This local root-only command will:"
+echo "  - set a new Owner password"
+echo "  - replace the Owner authenticator secret"
+echo "  - clear lockout and re-enable the Owner account"
+echo "  - revoke every existing Owner session"
+echo "  - revoke the Owner's paired phones and push tokens (unless you keep them)"
+echo "  - void the Owner's unused phone pairing codes"
+echo "  - write an immutable security audit event"
+echo
+read -r -p "Type RECOVER ${OWNER_USERNAME} to continue: " CONFIRM
+if [[ "$CONFIRM" != "RECOVER ${OWNER_USERNAME}" ]]; then
+    echo "Cancelled."
+    exit 1
+fi
+
+read -r -p "Emergency recovery reason: " REASON
+if [[ -z "${REASON// }" ]]; then
+    echo "ERROR: a recovery reason is required." >&2
+    exit 1
+fi
+
+# A lost or stolen phone is a common reason for this recovery, so the default is to revoke.
+read -r -p "Keep the Owner's paired phone(s)? [y/N]: " KEEP_PHONES_ANSWER
+if [[ "$KEEP_PHONES_ANSWER" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+    KEEP_PHONES="y"
+else
+    KEEP_PHONES="n"
+fi
+
+while true; do
+    read -r -s -p "Enter the new Owner password: " OWNER_PASSWORD
+    echo
+    read -r -s -p "Enter it again: " OWNER_PASSWORD_CONFIRM
+    echo
+
+    if [[ "$OWNER_PASSWORD" != "$OWNER_PASSWORD_CONFIRM" ]]; then
+        echo "Passwords did not match. Try again."
+        continue
+    fi
+
+    if (( ${#OWNER_PASSWORD} < 12 )); then
+        echo "Password must contain at least 12 characters."
+        continue
+    fi
+
+    break
+done
+unset OWNER_PASSWORD_CONFIRM
+
+TOTP_SECRET="$(
+    openssl rand 20 |
+        base32 |
+        tr -d '=\n' |
+        tr '[:lower:]' '[:upper:]'
+)"
+
+TOTP_URI="$(
+    python3 - "$OWNER_USERNAME" "$TOTP_SECRET" <<'PY'
+import sys
+from urllib.parse import quote
+
+username = sys.argv[1]
+secret = sys.argv[2]
+issuer = "RustDesk Directory"
+label = f"{issuer}:{username}"
+print(
+    "otpauth://totp/"
+    + quote(label, safe="")
+    + "?secret="
+    + quote(secret, safe="")
+    + "&issuer="
+    + quote(issuer, safe="")
+    + "&algorithm=SHA1&digits=6&period=30"
+)
+PY
+)"
+
+echo
+echo "Replace the RustDesk Directory entry in your authenticator."
+echo
+echo "Account: RustDesk Directory ($OWNER_USERNAME)"
+echo "Secret:  $TOTP_SECRET"
+echo
+echo "Manual setup URI:"
+echo "$TOTP_URI"
+echo
+
+while true; do
+    read -r -p "Enter the current 6-digit code from the NEW authenticator entry: " TOTP_CODE
+
+    if python3 - "$TOTP_SECRET" "$TOTP_CODE" <<'PY'
+import base64
+import hashlib
+import hmac
+import struct
+import sys
+import time
+
+secret_text = sys.argv[1].strip().upper()
+code = sys.argv[2].strip()
+if len(code) != 6 or not code.isdigit():
+    raise SystemExit(1)
+
+padding = "=" * ((8 - len(secret_text) % 8) % 8)
+secret = base64.b32decode(secret_text + padding, casefold=True)
+
+for offset in (-1, 0, 1):
+    counter = int(time.time()) // 30 + offset
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(secret, msg, hashlib.sha1).digest()
+    index = digest[-1] & 0x0F
+    value = (
+        ((digest[index] & 0x7F) << 24)
+        | ((digest[index + 1] & 0xFF) << 16)
+        | ((digest[index + 2] & 0xFF) << 8)
+        | (digest[index + 3] & 0xFF)
+    ) % 1_000_000
+    if hmac.compare_digest(f"{value:06d}", code):
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+    then
+        break
+    fi
+
+    echo "That code did not verify. Try again."
+done
+
+# The write, in one transaction inside the API container. Input on stdin, NUL-separated: owner id,
+# username, new password, new authenticator secret, reason, keep phones (y/n). Prints the counts
+# "sessions phone_keys push_tokens pairing_codes".
+RECOVER_PY="$(cat <<'PY'
+import os
+import sys
+
+import psycopg
+
+key = os.environ.get("TOTP_ENCRYPTION_SECRET", "")
+if not key:
+    sys.exit("TOTP_ENCRYPTION_SECRET is not set in the API container")
+fields = sys.stdin.buffer.read().decode("utf-8").split("\0")
+if len(fields) != 6:
+    sys.exit("malformed recovery input")
+owner_id, username, password, totp_secret, reason, keep = fields
+keep_phones = keep == "y"
+with psycopg.connect(
+    host=os.getenv("DATABASE_HOST", "database"),
+    port=int(os.getenv("DATABASE_PORT", "5432")),
+    dbname=os.getenv("DATABASE_NAME", "rustdesk_directory"),
+    user=os.getenv("DATABASE_USER", "rustdesk_directory"),
+    password=os.environ["DATABASE_PASSWORD"],
+    connect_timeout=5,
+) as connection:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE operator_accounts
+            SET
+                password_hash = crypt(%s, gen_salt('bf', 12)),
+                totp_secret_ciphertext = pgp_sym_encrypt(%s, %s),
+                totp_enabled = TRUE,
+                totp_confirmed_at = NOW(),
+                password_changed_at = NOW(),
+                must_change_password = FALSE,
+                failed_login_count = 0,
+                locked_until = NULL,
+                is_active = TRUE
+            WHERE id = %s
+              AND role = 'owner'
+            """,
+            (password, totp_secret, key, owner_id),
+        )
+        if cursor.rowcount != 1:
+            sys.exit("the Owner account changed meanwhile; nothing was written")
+        # Read back with the same key before anything is committed.
+        cursor.execute(
+            "SELECT pgp_sym_decrypt(totp_secret_ciphertext, %s) = %s FROM operator_accounts WHERE id = %s",
+            (key, totp_secret, owner_id),
+        )
+        if not cursor.fetchone()[0]:
+            sys.exit("the new authenticator secret did not read back; nothing was written")
+        cursor.execute(
+            """
+            UPDATE operator_sessions
+            SET
+                revoked_at = COALESCE(revoked_at, NOW()),
+                revoked_by = COALESCE(revoked_by, %s::uuid),
+                revocation_reason = COALESCE(
+                    revocation_reason,
+                    'sole_owner_emergency_recovery'
+                )
+            WHERE account_id = %s
+            """,
+            (owner_id, owner_id),
+        )
+        sessions = cursor.rowcount
+        phone_keys = push_tokens = 0
+        if not keep_phones:
+            cursor.execute(
+                "UPDATE mobile_device_keys SET revoked_at = NOW(), revoked_by = %s::uuid"
+                " WHERE account_id = %s AND revoked_at IS NULL",
+                (owner_id, owner_id),
+            )
+            phone_keys = cursor.rowcount
+            cursor.execute(
+                "UPDATE mobile_push_tokens SET revoked_at = NOW() WHERE account_id = %s AND revoked_at IS NULL",
+                (owner_id,),
+            )
+            push_tokens = cursor.rowcount
+        # Unused pairing codes go either way: they are not paired phones, and one baked into an
+        # app build may be the reason for this recovery.
+        cursor.execute(
+            "UPDATE mobile_pairing_codes SET used_at = NOW() WHERE account_id = %s AND used_at IS NULL",
+            (owner_id,),
+        )
+        pairing_codes = cursor.rowcount
+        cursor.execute(
+            """
+            INSERT INTO audit_events (
+                actor_account_id,
+                event_type,
+                target_type,
+                target_id,
+                source_ip,
+                details
+            )
+            VALUES (
+                NULL,
+                'operator.emergency_recovery',
+                'operator_account',
+                %s::uuid,
+                NULL,
+                jsonb_build_object(
+                    'username', %s::text,
+                    'reason', %s::text,
+                    'method', 'local_root_cli',
+                    'password_reset', TRUE,
+                    'totp_replaced', TRUE,
+                    'sessions_revoked', TRUE,
+                    'phones_kept', %s::boolean,
+                    'phone_keys_revoked', %s::int,
+                    'push_tokens_revoked', %s::int,
+                    'pairing_codes_voided', %s::int
+                )
+            )
+            """,
+            (owner_id, username, reason, keep_phones, phone_keys, push_tokens, pairing_codes),
+        )
+    connection.commit()
+print(sessions, phone_keys, push_tokens, pairing_codes)
+PY
+)"
+
+# printf is a shell builtin: the secrets appear on no command line.
+recovered="$(
+    printf '%s\0%s\0%s\0%s\0%s\0%s' \
+        "$OWNER_ID" "$OWNER_USERNAME" "$OWNER_PASSWORD" "$TOTP_SECRET" "$REASON" "$KEEP_PHONES" |
+        docker exec -i "$API_CONTAINER" python3 -I -c "$RECOVER_PY"
+)" || {
+    unset OWNER_PASSWORD
+    echo "ERROR: the recovery was not written (see the message above); nothing changed." >&2
+    exit 1
+}
+unset OWNER_PASSWORD
+read -r SESSIONS_REVOKED PHONE_KEYS_REVOKED PUSH_TOKENS_REVOKED PAIRING_CODES_VOIDED <<< "$recovered"
+
+echo
+echo "SOLE_OWNER_EMERGENCY_RECOVERY_COMPLETE"
+echo "Owner: $OWNER_USERNAME"
+echo "All previous Owner sessions are revoked (${SESSIONS_REVOKED:-?} session rows)."
+if [[ "$KEEP_PHONES" == "y" ]]; then
+    echo "Paired phones were kept; their sessions are revoked, so each signs in again."
+else
+    echo "Paired phones revoked: ${PHONE_KEYS_REVOKED:-?}, push tokens revoked: ${PUSH_TOKENS_REVOKED:-?}."
+    echo "Pair a phone again from /ops when you have signed in."
+fi
+echo "Unused phone pairing codes voided: ${PAIRING_CODES_VOIDED:-?}."
+echo "Sign in to /ops with the new password and the NEW authenticator entry."

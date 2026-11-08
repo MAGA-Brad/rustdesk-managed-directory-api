@@ -1,0 +1,263 @@
+# Example Caddy configuration for the directory server. Adapt TLS and any CDN/proxy settings to your own edge.
+#
+# Five hostnames, each serving only its own routes:
+#   rd.example.com        public rendezvous hostname: the relay-lease call plus the /ws/id and
+#                         /ws/relay WebSocket routes to hbbs/hbbr
+#   ops.example.com       the management (ops) UI and operator access resets only
+#   client.example.com    the managed-client API only
+#   filedrop.example.com  RustDrop blob transfers only
+#   ws.example.com        the same WebSocket routes on a hostname of their own
+# The API listens on 127.0.0.1:21120, hbbs's and hbbr's WebSocket listeners on 127.0.0.1:21118
+# and 127.0.0.1:21119.
+
+{
+	servers :443 {
+		# Without this, a request that TLS-handshakes with one SNI but
+		# sends a different Host header (e.g. ops.example.com) gets routed
+		# by Caddy to that OTHER hostname's site block anyway - Caddy picks
+		# the site purely by the decrypted Host header, never cross-checking
+		# it against the SNI used for the handshake. That would let a request
+		# reach the admin login UI or the managed-client API through another
+		# hostname, skipping anything tied to the hostname it actually names.
+		# This closes it for every hostname, present or future.
+		strict_sni_host
+
+		# Client address, optional. If you run behind a CDN or proxy, configure its address range
+		# and header here: only requests from those ranges may set that header, and {client_ip} in
+		# every site below becomes the address it carries. Left commented out, {client_ip} is the
+		# connecting address.
+		# trusted_proxies static <proxy-address-ranges>
+		# client_ip_headers <client-ip-header>
+	}
+}
+
+# TLS, the same for every site. Set TLS_CERT and TLS_KEY in Caddy's environment to a certificate
+# and key that cover every hostname below (for example a *.example.com certificate), or replace
+# this line with the `tls` settings that suit your own edge. With no `tls` line at all, Caddy
+# obtains certificates itself (automatic HTTPS).
+(site_tls) {
+	tls {$TLS_CERT} {$TLS_KEY}
+}
+
+# Edge client certificates (optional feature). The API takes these two headers as proof that an
+# edge in front of it verified the client's certificate, so a client must never be able to set
+# them. Every site imports this; remove the import only from a hostname that can be reached solely
+# through a CDN or proxy that sets both headers itself, overwriting any client-supplied value.
+(edge_cert_headers) {
+	request_header -X-Edge-Client-Cert-Verified
+	request_header -X-Edge-Client-Cert-Fingerprint
+}
+
+# uvicorn (the API on 21120) closes idle keep-alive connections after 5 s, but Caddy keeps
+# them for 2 min by default, so a request sent on one just as uvicorn closes it gets EOF and
+# a 502. Close ours first.
+(api_upstream) {
+	transport http {
+		keepalive 3s
+	}
+}
+
+rd.example.com {
+	import site_tls
+	import edge_cert_headers
+	encode gzip
+
+	@private_docs path /docs* /redoc* /openapi.json
+	respond @private_docs 404
+
+	@management path /ops /ops/*
+	respond @management 404
+
+	@recovery path /v1/operator-access-resets/setup /v1/operator-access-resets/accept
+	respond @recovery 404
+
+	# Explicit managed-client API allowlist for rd.example.com.
+	@managed_client_api path /v1/device/relay-lease
+	handle @managed_client_api {
+		reverse_proxy 127.0.0.1:21120 {
+			import api_upstream
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	# Native RustDesk protocol over WebSocket, for clients on networks that
+	# block the raw TCP/UDP ports (21115/21116/21117) but allow standard
+	# HTTPS out (e.g. restrictive mobile hotspots). Path convention is
+	# fixed by the client's own hbb_common/websocket.rs check_ws() - do not
+	# change these paths without also changing the client. hbbs's websocket
+	# listener is 21118 (id/rendezvous), hbbr's is 21119 (relay); both run
+	# in network_mode: host so localhost reaches them directly.
+	@rustdesk_ws_id path /ws/id
+	handle @rustdesk_ws_id {
+		reverse_proxy 127.0.0.1:21118 {
+			stream_close_delay 2h
+			header_up X-Real-IP {client_ip}
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	@rustdesk_ws_relay path /ws/relay
+	handle @rustdesk_ws_relay {
+		reverse_proxy 127.0.0.1:21119 {
+			stream_close_delay 2h
+			header_up X-Real-IP {client_ip}
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+ops.example.com {
+	import site_tls
+	import edge_cert_headers
+	encode gzip
+
+	@private_docs path /docs* /redoc* /openapi.json
+	respond @private_docs 404
+
+	# Management UI only. Managed-client API traffic belongs on client.example.com.
+	@managed_client_api path /v1/enrollment/devices /v1/enrollment/status /v1/device/me /v1/device/heartbeat /v1/device/contact-email /v1/directory /v1/device/relay-lease /v1/device/session-heartbeat /v1/device/connection-event /v1/updates/latest /v1/updates/releases/*
+	respond @managed_client_api 404
+
+	@ops path /ops /ops/*
+	handle @ops {
+		reverse_proxy 127.0.0.1:21120 {
+			import api_upstream
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	@recovery path /v1/operator-access-resets/setup /v1/operator-access-resets/accept
+	handle @recovery {
+		reverse_proxy 127.0.0.1:21120 {
+			import api_upstream
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+client.example.com {
+	import site_tls
+	import edge_cert_headers
+	encode gzip
+
+	@private_docs path /docs* /redoc* /openapi.json
+	respond @private_docs 404
+
+	@management path /ops /ops/*
+	respond @management 404
+
+	@recovery path /v1/operator-access-resets/setup /v1/operator-access-resets/accept
+	respond @recovery 404
+
+	# Managed-client API only.
+	@managed_client_api path /v1/enrollment/devices /v1/enrollment/status /v1/enrollment/reenrollment-request /v1/enrollment/reenroll /v1/device/me /v1/device/heartbeat /v1/device/contact-email /v1/directory /v1/device/relay-lease /v1/device/session-heartbeat /v1/device/connection-event /v1/updates/latest /v1/updates/releases/* /v1/messaging/* /v1/device/log-upload /v1/filedrop/* /v1/device/peer-cert /v1/peer-auth/ca /v1/device/edge-cert /v1/sealed /v1/device/wait
+	handle @managed_client_api {
+		reverse_proxy 127.0.0.1:21120 {
+			import api_upstream
+			stream_close_delay 2h
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+filedrop.example.com {
+	import site_tls
+	import edge_cert_headers
+	encode gzip
+
+	# A separate transfer hostname for large RustDrop uploads/downloads. Scope is
+	# kept to just the filedrop blob path; everything else stays on
+	# client.example.com.
+	@filedrop_api path /v1/filedrop/*
+	handle @filedrop_api {
+		reverse_proxy 127.0.0.1:21120 {
+			import api_upstream
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+# Native RustDesk protocol over WebSocket on a hostname of its own: the same /ws/id and /ws/relay
+# routes as rd.example.com, used as a fallback by managed clients built with
+# RUSTDESK_MANAGED_WS_FALLBACK_HOST on networks that block the raw ports. hbbs/hbbr take the
+# client IP from X-Real-IP.
+ws.example.com {
+	import site_tls
+	import edge_cert_headers
+
+	@rustdesk_ws_id path /ws/id
+	handle @rustdesk_ws_id {
+		reverse_proxy 127.0.0.1:21118 {
+			stream_close_delay 2h
+			header_up X-Real-IP {client_ip}
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	@rustdesk_ws_relay path /ws/relay
+	handle @rustdesk_ws_relay {
+		reverse_proxy 127.0.0.1:21119 {
+			stream_close_delay 2h
+			header_up X-Real-IP {client_ip}
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}

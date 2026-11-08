@@ -1,0 +1,19 @@
+[Unit]
+Description=Sync RDS-approved device ids for the relay's approved-device gate
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rustdesk-approved-ids-sync
+# Root only for docker and the relay's root-owned data dir. A write that still went astray (the
+# data dir is writable by hbbs/hbbr) can't reach /etc, /usr, /root or other apps' files.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/rustdesk-oss
+RuntimeDirectory=rustdesk-approved-ids-sync
+RuntimeDirectoryMode=0750
+Environment=HOME=/run/rustdesk-approved-ids-sync
+TimeoutStartSec=50s

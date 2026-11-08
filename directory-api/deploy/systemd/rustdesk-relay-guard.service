@@ -1,0 +1,24 @@
+[Unit]
+Description=RustDesk approved-device relay firewall synchronizer
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/rustdesk-relay-guard-sync
+Restart=always
+RestartSec=2s
+
+# The synchronizer must run as root because it manages nftables and reads
+# the local Docker/PostgreSQL service. Keep the process sandboxed while
+# creating its volatile /run directory correctly on every boot.
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+RuntimeDirectory=rustdesk-relay-guard
+RuntimeDirectoryMode=0750
+ReadWritePaths=/run/rustdesk-relay-guard
+
+[Install]
+WantedBy=multi-user.target

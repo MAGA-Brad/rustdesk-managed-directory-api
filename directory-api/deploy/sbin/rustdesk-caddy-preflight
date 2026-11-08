@@ -1,0 +1,15 @@
+#!/bin/bash
+set -euo pipefail
+
+if runuser -u caddy -- test -x /; then
+    exit 0
+fi
+
+MODE="$(stat -c '%a' /)"
+logger -t rustdesk-caddy-preflight     "WARNING: caddy cannot traverse /. Current mode=${MODE}. Correcting / to 0755."
+chmod 0755 /
+if ! runuser -u caddy -- test -x /; then
+    logger -t rustdesk-caddy-preflight         "ERROR: caddy still cannot traverse / after correction."
+    exit 1
+fi
+logger -t rustdesk-caddy-preflight     "Root filesystem permissions corrected successfully."
